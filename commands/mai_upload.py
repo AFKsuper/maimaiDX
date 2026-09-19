@@ -12,8 +12,9 @@ from maimai_py.exceptions import (
     TitleServerNetworkError,
 )
 from nonebot import NoneBot
+from nonebot.message import CanceledException
 
-from hoshino.typing import CQEvent
+from hoshino.typing import CQEvent, Message
 
 from ..config import log, sv
 from ..core.database.qq import clear_upload_credentials, update_user
@@ -53,10 +54,15 @@ CREDENTIAL_GUIDE = {
     ServiceName.LXNS: LXNS_TOKEN_GUIDE,
 }
 
-upload = sv.on_prefix(["上传成绩", "上传分数", "传分"])
-dftoken = sv.on_prefix(["水鱼导入token", "水鱼导入Token", "dftoken"])
-lxtoken = sv.on_prefix(["落雪个人密钥", "落雪上传密钥", "lxtoken"])
-delete_token = sv.on_fullmatch(["删除上传凭据", "清除上传凭据"])
+UPLOAD_PREFIXES = ["上传成绩", "上传分数", "传分"]
+DFTOKEN_PREFIXES = ["水鱼导入token", "水鱼导入Token", "dftoken"]
+LXTOKEN_PREFIXES = ["落雪个人密钥", "落雪上传密钥", "lxtoken"]
+DELETE_PREFIXES = ["删除上传凭据", "清除上传凭据"]
+
+upload = sv.on_prefix(UPLOAD_PREFIXES)
+dftoken = sv.on_prefix(DFTOKEN_PREFIXES)
+lxtoken = sv.on_prefix(LXTOKEN_PREFIXES)
+delete_token = sv.on_fullmatch(DELETE_PREFIXES)
 
 
 def is_private(ev: CQEvent) -> bool:
@@ -64,7 +70,7 @@ def is_private(ev: CQEvent) -> bool:
 
 
 @upload
-async def _(bot: NoneBot, ev: CQEvent):
+async def handle_upload(bot: NoneBot, ev: CQEvent):
     user = await GetOrCreateSender(bot, ev)
     qrcode = ev.message.extract_plain_text().strip()
     if not qrcode:
@@ -120,7 +126,7 @@ async def _(bot: NoneBot, ev: CQEvent):
 
 
 @dftoken
-async def _(bot: NoneBot, ev: CQEvent):
+async def handle_dftoken(bot: NoneBot, ev: CQEvent):
     if not is_private(ev):
         await bot.finish(ev, PRIVATE_ONLY_MSG, at_sender=True)
     user = await GetOrCreateSender(bot, ev)
@@ -137,7 +143,7 @@ async def _(bot: NoneBot, ev: CQEvent):
 
 
 @lxtoken
-async def _(bot: NoneBot, ev: CQEvent):
+async def handle_lxtoken(bot: NoneBot, ev: CQEvent):
     if not is_private(ev):
         await bot.finish(ev, PRIVATE_ONLY_MSG, at_sender=True)
     user = await GetOrCreateSender(bot, ev)
@@ -154,10 +160,41 @@ async def _(bot: NoneBot, ev: CQEvent):
 
 
 @delete_token
-async def _(bot: NoneBot, ev: CQEvent):
+async def handle_delete_token(bot: NoneBot, ev: CQEvent):
     user = await GetOrCreateSender(bot, ev)
     cleared = await clear_upload_credentials(user.qqid)
     if cleared:
         await bot.send(ev, "已删除您保存的全部上传凭据。", at_sender=True)
     else:
         await bot.send(ev, "您没有保存任何上传凭据。", at_sender=True)
+
+
+# hoshino 的消息预处理器只把群消息分发给 sv 的触发器，私聊需要单独注册。
+PRIVATE_COMMANDS = sorted(
+    [
+        (prefix, handler)
+        for prefixes, handler in (
+            (UPLOAD_PREFIXES, handle_upload),
+            (DFTOKEN_PREFIXES, handle_dftoken),
+            (LXTOKEN_PREFIXES, handle_lxtoken),
+            (DELETE_PREFIXES, handle_delete_token),
+        )
+        for prefix in prefixes
+    ],
+    key=lambda item: len(item[0]),
+    reverse=True,
+)
+
+
+@sv.on_message("private")
+async def _(bot: NoneBot, ev: CQEvent):
+    text = ev.message.extract_plain_text().strip()
+    for prefix, handler in PRIVATE_COMMANDS:
+        if not text.startswith(prefix):
+            continue
+        ev.message = Message(text[len(prefix) :].strip())
+        try:
+            await handler(bot, ev)
+        except CanceledException:
+            pass
+        return

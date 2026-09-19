@@ -131,7 +131,7 @@
 1. 玩家私聊 BOT 保存上传凭据，两种数据源各用各的凭据，指令只在私聊中生效：
    - 水鱼：在 https://www.diving-fish.com/maimaidx/prober/ 的「编辑个人资料」中复制「导入 Token」，发送 `水鱼导入token <Token>`
    - 落雪：在 https://maimai.lxns.net/user/profile 复制「个人 API 密钥」，发送 `落雪个人密钥 <密钥>`（未配置时，若 BOT 已有开发者 Token 且玩家已绑定好友码，会回退到开发者 Token 上传）
-2. 获取舞萌二维码内容（形如 `SGWCMAID...`），发送 `上传成绩 SGWCMAID...`，BOT 会拉取全部成绩并写入 `数据源` 指令所选的查分器
+2. 获取舞萌二维码内容（形如 `SGWCMAID...`），发送 `上传成绩 SGWCMAID...`，BOT 会拉取全部成绩并写入 `数据源` 指令所选的查分器，群聊与私聊均可
 3. 不再需要上传时，发送 `删除上传凭据` 清除保存的凭据
 
 > [!WARNING]
