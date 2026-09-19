@@ -86,6 +86,7 @@
    MAIMAIDX_PATH=                       # 必填项，静态文件夹路径，必须为绝对路径到 `/static`，例如：e:/SakuraBOT/nbstatic/maimaidx/static
    MAIMAIDX_ALIAS_PUSH=true             # 是否开启别名推送
    MAIMAIDX_ALIAS_PROXY=false           # 是否使用中转访问柚子别名服务器，适用于境内服务器
+   MAIMAIDX_ARCADE_HTTP_PROXY=          # 选填，二维码上传成绩时访问舞萌服务器使用的 HTTP 代理，例如：http://127.0.0.1:7890
    SAVE_IN_MEMORY=true                  # 是否将部分图片保存在内存
    ASSETS_ONLINE=true                   # 对于有 `icon` 和 `plate` 资源的可将此项改为 `false`，如果没有请默认，否则使用落雪查分器时无法使用
 
@@ -122,6 +123,19 @@
 8. 重启 `HoshinoBot`
 9. 使用 `更新定数表`，`更新完成表` 指令完成图片生成
 10. 开始使用
+
+## 上传成绩
+
+基于 [maimai.py](https://github.com/TrueRou/maimai.py) 的 `ArcadeProvider`，玩家可以用游戏机二维码把成绩传到查分器，无需额外的代理服务。
+
+1. 玩家私聊 BOT 保存上传凭据，两种数据源各用各的凭据，指令只在私聊中生效：
+   - 水鱼：在 https://www.diving-fish.com/maimaidx/prober/ 的「编辑个人资料」中复制「导入 Token」，发送 `水鱼导入token <Token>`
+   - 落雪：在 https://maimai.lxns.net/user/profile 复制「个人 API 密钥」，发送 `落雪个人密钥 <密钥>`（未配置时，若 BOT 已有开发者 Token 且玩家已绑定好友码，会回退到开发者 Token 上传）
+2. 获取舞萌二维码内容（形如 `SGWCMAID...`），发送 `上传成绩 SGWCMAID...`，BOT 会拉取全部成绩并写入 `数据源` 指令所选的查分器
+3. 不再需要上传时，发送 `删除上传凭据` 清除保存的凭据
+
+> [!WARNING]
+> 二维码有效期只有几分钟，且换取玩家身份的请求必须由能直连舞萌 title 服务器的机器发出。境外服务器或被风控的云服务器会直接被拒绝，此时请配置 `MAIMAIDX_ARCADE_HTTP_PROXY` 指向一台可用的境内代理。
 
 ## 更新说明
 
