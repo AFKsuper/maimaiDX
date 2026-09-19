@@ -33,6 +33,7 @@ class BaseConfig(Settings):
     maimaidx_path: str
     maimaidx_alias_proxy: bool = False
     maimaidx_alias_push: bool = True
+    maimaidx_arcade_http_proxy: str | None = None
     save_in_memory: bool | None = True
     assets_online: bool | None = True
     bot_name: str = (
