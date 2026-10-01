@@ -34,15 +34,27 @@ async def _():
     else:
         log.opt(colors=True).info("别名推送为「<r>关闭</r>」状态")
 
-    log.info("正在获取maimai曲目数据")
-    await mai.get_music()
-    log.info("正在获取maimai曲目别名数据")
-    await mai.get_music_alias()
-    log.info("正在获取maimai牌子数据")
-    await mai.get_plate_json()
-    guess.guess()
-    log.success("猜歌数据初始化完成")
-    log.success("maimai数据获取完成")
+    # 数据源（水鱼/落雪/柚子）卡死或超时会把 lifespan 启动拖过 hypercorn 的
+    # startup_timeout（默认60秒），导致 LifespanTimeoutError 启动崩溃；
+    # 故放入后台任务加载，启动钩子立即完成，数据就绪前查分指令暂不可用
+    async def _load_data():
+        try:
+            log.info("正在获取maimai曲目数据")
+            await mai.get_music()
+            log.info("正在获取maimai曲目别名数据")
+            await mai.get_music_alias()
+            log.info("正在获取maimai牌子数据")
+            await mai.get_plate_json()
+            guess.guess()
+            log.success("猜歌数据初始化完成")
+            log.success("maimai数据获取完成")
+        except Exception:
+            # 单个数据源失败不再中断整体加载，避免猜歌与定时任务不启动
+            log.exception("启动数据加载出错，部分功能可能不可用")
+        finally:
+            scheduler.start()
+
+    asyncio.ensure_future(_load_data())
 
     if dfconfig.oauth_enabled:
         log.opt(colors=True).info(
@@ -83,4 +95,3 @@ async def _():
             "可能导致「完成表」指令无法使用，"
             "请及时私聊BOT使用指令「更新完成表」进行生成。"
         )
-    scheduler.start()

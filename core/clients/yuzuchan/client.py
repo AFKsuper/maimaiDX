@@ -16,7 +16,9 @@ JSONData = dict[str, Any] | list[Any]
 
 class YuzuChaNAPI(ApiClient):
     def __init__(self):
-        super().__init__(base_url=BASE_URL)
+        # 默认 180 秒超时太长，柚子服务器挂起时会拖死启动/请求，
+        # 降到 30 秒让上层尽快走本地暂存文件降级
+        super().__init__(base_url=BASE_URL, timeout=30)
         self.music_endpoint = "/maimaidx/music"
         self.aliases_endpoint = "/aliases/maimaidx"
 

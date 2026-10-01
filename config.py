@@ -35,6 +35,8 @@ class BaseConfig(Settings):
     maimaidx_alias_push: bool = True
     save_in_memory: bool | None = True
     assets_online: bool | None = True
+    # 成绩上传（maimai-update 融入）：拉取/上传成绩用的 HTTP 代理，留空则直连
+    mai_http_proxy: str | None = None
     bot_name: str = (
         NICKNAME
         if isinstance(NICKNAME, str)

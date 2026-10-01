@@ -41,6 +41,7 @@ merge_music_file = data_dir / "merge_music_data.json"  # 合并曲目数据文�
 merge_alias_file = data_dir / "merge_music_alias.json"  # 合并曲目别名数据文件
 # 机厅
 arcades_json = data_dir / 'arcades.json'  # 机厅
+arcade_city_json = data_dir / 'group_arcade_city.json'  # 群绑定的机厅城市
 
 
 # 字体路径

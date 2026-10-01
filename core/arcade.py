@@ -1,4 +1,5 @@
 import json
+import re
 import time
 import traceback
 
@@ -6,7 +7,7 @@ import httpx
 from pydantic import BaseModel
 
 from ..config import log
-from ..resources import arcades_json
+from ..resources import arcades_json, arcade_city_json
 from .tool import writefile
 
 
@@ -25,17 +26,58 @@ class Arcade(BaseModel):
     time: str
 
 
+def match_city(arcade: Arcade, city: str) -> bool:
+    """机厅是否属于指定城市。
+
+    `city` 可为多个城市，用空格或逗号分隔（如 `广州 深圳`），
+    任一城市命中即算归属；`city` 为空表示不限定城市。
+    官方数据没有城市字段，城市名需在地址/店名/商场/省份中命中。
+    地址/商场字段必须命中「XX市」完整形式，避免"南昌路（在洛阳）"这类
+    路名和官方脏 mall 字段（曾把别家店名写进 mall）误判；
+    店名/省份允许裸城市名命中（如"环游嘉年华广州天河城店"）。
+    """
+    if not city:
+        return True
+    keys = [
+        k.removesuffix("市").lower()
+        for k in city.replace(",", " ").replace("，", " ").split()
+        if k.removesuffix("市")
+    ]
+    if not keys:
+        return True
+    # 地址/商场只认「城市+市」的完整行政区划写法
+    strict_fields = [arcade.location, arcade.mall]
+    if any(
+        k + "市" in f.lower() for k in keys for f in strict_fields
+    ):
+        return True
+    # 兜底：地址中紧跟省/自治区之后的城市名（如"广东省广州萝岗"缺"市"）
+    if any(
+        re.search(rf"(?:省|自治区)[^省市区县]{{0,4}}{re.escape(k)}", arcade.location, re.I)
+        for k in keys
+    ):
+        return True
+    fields = [arcade.name, arcade.province]
+    return any(k in f.lower() for k in keys for f in fields)
+
+
 class ArcadeList(list[Arcade]):
 
 
     async def save_arcade(self):
-        return await writefile(arcades_json, [_.model_dump() for _ in self])
+        data = [_.model_dump() for _ in self]
+        # 同步内存快照，否则凌晨4点下载机厅数据时会用启动时的旧快照覆盖，
+        # 把运行期间设置的别名/订阅/人数全部清掉
+        arcade.arcades = data
+        return await writefile(arcades_json, data)
     
-    def search_name(self, name: str) -> list[Arcade]:
-        """模糊查询机厅"""
+    def search_name(self, name: str, city: str = "") -> list[Arcade]:
+        """模糊查询机厅，`city` 非空时仅查询该城市"""
         arcade_list = []
         name = name.lower()
         for arcade in self:
+            if not match_city(arcade, city):
+                continue
             if name in arcade.name.lower():
                 arcade_list.append(arcade)
             elif name in arcade.location.lower():
@@ -45,32 +87,42 @@ class ArcadeList(list[Arcade]):
 
         return arcade_list
     
-    def search_fullname(self, name: str) -> list[Arcade]:
-        """查询店铺全名机厅"""
+    def search_fullname(self, name: str, city: str = "") -> list[Arcade]:
+        """查询店铺全名机厅，`city` 非空时仅查询该城市"""
         arcade_list = []
         for arcade in self:
+            if not match_city(arcade, city):
+                continue
             if name == arcade.name:
                 arcade_list.append(arcade)
 
         return arcade_list
     
-    def search_alias(self, alias: str) -> list[Arcade]:
-        """查询别名机厅"""
+    def search_alias(self, alias: str, city: str = "") -> list[Arcade]:
+        """查询别名机厅，`city` 非空时仅查询该城市"""
         arcade_list = []
         for arcade in self:
+            if not match_city(arcade, city):
+                continue
             if alias in arcade.alias:
                 arcade_list.append(arcade)
         
         return arcade_list
     
-    def search_id(self, id: str) -> list[Arcade]:
-        """指定ID查询机厅"""
+    def search_id(self, id: str, city: str = "") -> list[Arcade]:
+        """指定ID查询机厅，`city` 非空时仅查询该城市"""
         arcade_list = []
         for arcade in self:
+            if not match_city(arcade, city):
+                continue
             if id == arcade.id:
                 arcade_list.append(arcade)
 
         return arcade_list
+
+    def search_city(self, city: str) -> list[Arcade]:
+        """查询指定城市的全部机厅"""
+        return [arcade for arcade in self if match_city(arcade, city)]
 
     def add_arcade(self, arcade: dict) -> bool:
         """添加机厅"""
@@ -133,11 +185,63 @@ class ArcadeData:
         else:
             return None
     
+    def fix_duplicate_ids(self) -> bool:
+        """修复重复的机厅 id（旧版连续添加自建机厅会生成相同 id），返回是否有改动"""
+        used: set[int] = {int(a.id) for a in self.total}
+        seen: set[str] = set()
+        next_id = max(10000, max(used) + 1 if used else 10000)
+        changed = False
+        for a in self.total:
+            if a.id in seen:
+                while next_id in used:
+                    next_id += 1
+                log.warning(f"机厅「{a.name}」的 id 重复（{a.id}），已重新分配为 {next_id}")
+                a.id = str(next_id)
+                used.add(next_id)
+                next_id += 1
+                changed = True
+            seen.add(a.id)
+        if changed:
+            self.idList = [int(a.id) for a in self.total]
+        return changed
+
     async def get_arcade(self):
         self.total = await download_arcade_info()
         self.idList = [int(c_a.id) for c_a in self.total]
+        if self.fix_duplicate_ids():
+            log.warning("检测到重复机厅 id，已自动修复并保存")
+            await self.total.save_arcade()
 
 arcade = ArcadeData()
+
+
+class GroupCity:
+    """群绑定的机厅城市，`{群号: 城市}`，未绑定的城市为空字符串"""
+
+    def __init__(self) -> None:
+        self.data: dict[str, str] = {}
+        if arcade_city_json.exists():
+            try:
+                raw = json.load(open(arcade_city_json, "r", encoding="utf-8"))
+                self.data = {str(k): str(v) for k, v in raw.items()}
+            except Exception:
+                log.error(f"读取群机厅城市绑定失败，已忽略\n{traceback.format_exc()}")
+                self.data = {}
+
+    def get(self, group_id: int) -> str:
+        return self.data.get(str(group_id), "")
+
+    async def set(self, group_id: int, city: str) -> None:
+        self.data[str(group_id)] = city
+        await writefile(arcade_city_json, self.data)
+
+    async def remove(self, group_id: int) -> None:
+        if str(group_id) in self.data:
+            del self.data[str(group_id)]
+            await writefile(arcade_city_json, self.data)
+
+
+group_city = GroupCity()
 
 
 def _official_arcade_to_dict(raw: dict, cached: dict | None = None) -> dict:
@@ -169,7 +273,14 @@ async def download_arcade_info(save: bool = True) -> ArcadeList:
             resp.raise_for_status()
             data = resp.json()
 
-        cached_map = {str(_["id"]): _ for _ in arcade.arcades}
+        # 缓存优先取内存中最新的 total（含运行期设置的别名/订阅/人数），
+        # total 为空时才退回启动时读盘的快照，防止旧快照覆盖丢失用户数据
+        cached_list = (
+            [_.model_dump() for _ in arcade.total]
+            if getattr(arcade, "total", None)
+            else arcade.arcades
+        )
+        cached_map = {str(_["id"]): _ for _ in cached_list}
         merged = ArcadeList()
 
         for raw in data:
@@ -182,7 +293,7 @@ async def download_arcade_info(save: bool = True) -> ArcadeList:
 
         custom_arcades = [
             Arcade.model_validate(_)
-            for _ in arcade.arcades
+            for _ in cached_list
             if int(_["id"]) >= 10000
         ]
         merged.extend(custom_arcades)
@@ -244,13 +355,13 @@ async def update_alias(arcadeName: str, aliasName: str, add_del: bool):
     return msg
 
 
-async def subscribe(group_id: int, arcadeName: str, sub: bool):
-    """订阅机厅，`sub` 等于 `True` 为订阅，`False` 为取消订阅"""
+async def subscribe(group_id: int, arcadeName: str, sub: bool, city: str = ""):
+    """订阅机厅，`sub` 等于 `True` 为订阅，`False` 为取消订阅，`city` 非空时限定该城市"""
     change = False
     if arcadeName.isdigit():
-        arcade_list = arcade.total.search_id(arcadeName)
+        arcade_list = arcade.total.search_id(arcadeName, city)
     else:
-        arcade_list = arcade.total.search_fullname(arcadeName)
+        arcade_list = arcade.total.search_fullname(arcadeName, city)
     if arcade_list:
         _arcade = arcade_list[0]
         if sub:

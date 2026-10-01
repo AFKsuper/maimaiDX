@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -31,8 +32,11 @@ async def openfile(file: Path) -> dict | list:
 
 
 async def writefile(file: Path, data: Any) -> bool:
-    async with aiofiles.open(file, "w", encoding="utf-8") as f:
+    # 先写临时文件再原子替换，避免写入中途崩溃导致数据文件损坏
+    tmp = file.with_name(file.name + ".tmp")
+    async with aiofiles.open(tmp, "w", encoding="utf-8") as f:
         await f.write(json.dumps(data, ensure_ascii=False, indent=4))
+    os.replace(tmp, file)
     return True
 
 
