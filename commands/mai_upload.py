@@ -6,7 +6,8 @@
 - mai绑定（别名 舞萌上传绑定 / 裸发 SGWCMAID 文本）——二维码换机台凭据
 - mai绑定状态 —— 机台凭据 + 水鱼/落雪授权状态（凭据脱敏）
 - mai上传 —— 拉取机台成绩并上传到已设置平台
-- 自动上传成绩 —— 开关「每天 03:50 自动上传成绩」（每人独立，重发即切换开/关）
+- 自动上传成绩 —— 开关探测式自动更新（每人独立，重发即切换开/关）
+  成绩有变化才上传（hot/warm/cold 分层探测），每天 03:50 兜底整体同步一次
 - mai帮助 —— 查看本帮助
 
 隐私：mai绑定 的回复会提醒用户撤回消息。
@@ -21,6 +22,7 @@ core 层（arcade_qr / arcade_store / uploader）并行开发可能未就绪，
 
 import asyncio
 import base64
+import hashlib
 import json
 import time
 from typing import Optional
@@ -119,8 +121,9 @@ SV_HELP = """【maimaiDX 舞萌成绩上传】
    （授权命令只能在群里发送）
 3. mai绑定状态 —— 查看绑定情况（凭据脱敏）
 4. mai上传 —— 拉取机台成绩并上传到已设置平台
-5. 自动上传成绩 —— 开关「每天 03:50 自动上传成绩」（重发即切换）
-   自动上传成绩 开 / 自动上传成绩 关 / 自动上传成绩 状态
+5. 自动上传成绩 —— 开关探测式自动更新（重发即切换）
+   成绩有变化才上传（刚变化 15 分钟 / 近期 30 分钟 / 平时 60 分钟探测一次）
+   每天 03:50 再兜底整体同步一次；自动上传成绩 开 / 关 / 状态
 mai帮助 查看本帮助"""
 
 # ============================================================
@@ -559,6 +562,13 @@ AUTO_UPLOAD_HOUR = 3
 AUTO_UPLOAD_MINUTE = 50
 _AUTO_UPLOAD_TIME = f"{AUTO_UPLOAD_HOUR:02d}:{AUTO_UPLOAD_MINUTE:02d}"
 
+# —— 探测式自动更新（参考 maimai-score-hub 的 auto-update：先探测、有变化才写）——
+AUTO_TICK_MINUTES = 5                                   # 调度心跳：每 5 分钟看谁到期
+AUTO_PROBE_MINUTES = {"hot": 15, "warm": 30, "cold": 60}  # 活跃分层探测间隔
+AUTO_HOT_MINUTES = 120                                  # 探测到变化后 2 小时内按 hot
+AUTO_WARM_MINUTES = 720                                 # 12 小时内按 warm，之后 cold
+AUTO_FAIL_BACKOFF_MINUTES = (15, 30, 60, 120)           # 连续失败后的退避间隔
+
 _AUTO_ON_WORDS = ("开", "开启", "打开", "启用", "on")
 _AUTO_OFF_WORDS = ("关", "关闭", "停", "停用", "取消", "off")
 _AUTO_STATUS_WORDS = ("状态", "查询", "查看")
@@ -570,8 +580,79 @@ def _auto_upload_usage() -> str:
         "· 自动上传成绩 —— 开关切换（已开启则关闭）\n"
         "· 自动上传成绩 开（或 关）\n"
         "· 自动上传成绩 状态\n"
-        f"开启后每天 {_AUTO_UPLOAD_TIME}（北京时间）自动拉取机台成绩并上传。"
+        "开启后机器人会定期探测机台成绩，**发现成绩有变化才上传**"
+        "（刚有变化 15 分钟一次 / 近期 30 分钟 / 平时 1 小时），"
+        f"另外每天 {_AUTO_UPLOAD_TIME} 兜底整体上传一次。"
     )
+
+
+def _scores_hash(score_list) -> str:
+    """成绩指纹：只取成绩相关字段。
+
+    刻意排除 play_count / play_time —— 它们每次游玩都会变，会把「没涨分」的游玩
+    也当成绩变化（score-hub 同样只看 achievement / dxScore 这类成绩字段）。
+    """
+    rows = []
+    for s in score_list or []:
+        rows.append((
+            getattr(s, "id", None),
+            getattr(s, "level_index", None),
+            getattr(s, "achievements", None),
+            getattr(s, "dx_score", None),
+            str(getattr(s, "fc", "") or ""),
+            str(getattr(s, "fs", "") or ""),
+        ))
+    rows.sort(key=lambda r: (str(r[0]), str(r[1])))
+    return hashlib.sha256(repr(rows).encode("utf-8")).hexdigest()
+
+
+def _parse_ts(value) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _fmt_ts(value) -> str:
+    ts = _parse_ts(value)
+    if not ts:
+        return "无"
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+
+
+def _auto_tier(rec: dict, now: float) -> str:
+    """活跃分层（对应 score-hub 的 hot / warm / cold）。"""
+    changed = _parse_ts(rec.get("auto_changed_at"))
+    if not changed:
+        return "cold"
+    if now - changed <= AUTO_HOT_MINUTES * 60:
+        return "hot"
+    if now - changed <= AUTO_WARM_MINUTES * 60:
+        return "warm"
+    return "cold"
+
+
+def _auto_due(rec: dict, now: float) -> bool:
+    """到探测时间了吗（auto_next_at 为空视为立即到期）。"""
+    return now >= _parse_ts(rec.get("auto_next_at"))
+
+
+def _auto_schedule(rec: dict, now: float, changed: bool, ok: bool) -> dict:
+    """算下一次探测时间与状态字段：成功按分层间隔，失败按退避间隔。"""
+    if not ok:
+        fail = int(rec.get("auto_fail") or 0) + 1
+        idx = min(fail, len(AUTO_FAIL_BACKOFF_MINUTES)) - 1
+        return {
+            "auto_fail": fail,
+            "auto_next_at": str(int(now + AUTO_FAIL_BACKOFF_MINUTES[idx] * 60)),
+        }
+    fields = {"auto_fail": 0, "auto_checked_at": _fmt_ts(now)}
+    if changed:
+        fields["auto_changed_at"] = str(int(now))
+    tier = _auto_tier({**rec, **fields}, now)
+    fields["auto_tier"] = tier
+    fields["auto_next_at"] = str(int(now + AUTO_PROBE_MINUTES[tier] * 60))
+    return fields
 
 
 def _notify_target(ev: CQEvent) -> dict:
@@ -585,9 +666,22 @@ def _notify_target(ev: CQEvent) -> dict:
 
 def _auto_upload_status_text(rec: dict, on: bool) -> str:
     lines = [f"【自动上传成绩】{'✅ 已开启' if on else '▫ 已关闭'}"]
-    lines.append(f"定时：每天 {_AUTO_UPLOAD_TIME}（北京时间）")
     if on:
-        lines.append(f"开启于：{rec.get('auto_upload_at') or '未知时间'}")
+        now = time.time()
+        tier = _auto_tier(rec, now)
+        tier_name = {
+            "hot": "hot（刚有变化，15 分钟探测一次）",
+            "warm": "warm（近期有变化，30 分钟探测一次）",
+            "cold": "cold（平时，1 小时探测一次）",
+        }[tier]
+        lines.append("模式：探测式自动更新（成绩有变化才上传）")
+        lines.append(f"活跃分层：{tier_name}")
+        lines.append(f"上次探测：{rec.get('auto_checked_at') or '尚未探测'}")
+        lines.append(f"上次发现变化：{_fmt_ts(rec.get('auto_changed_at'))}")
+        lines.append(f"下次探测：{_fmt_ts(rec.get('auto_next_at'))}")
+        if rec.get("auto_fail"):
+            lines.append(f"⚠ 连续失败 {rec.get('auto_fail')} 次（已自动退避重试）")
+        lines.append(f"兜底全量：每天 {_AUTO_UPLOAD_TIME} 再整体上传一次")
         group_id = rec.get("auto_upload_group") or ""
         if group_id:
             lines.append(f"结果通知：先私聊；私聊失败时在群 {group_id} 里 @ 你")
@@ -630,7 +724,8 @@ async def _handle_auto_upload(bot: NoneBot, ev: CQEvent, arg: str = "") -> None:
                 at_sender=True,
             )
             return
-        rec = set(qq, auto_upload=True, auto_upload_at=now_str(), **_notify_target(ev))
+        rec = set(qq, auto_upload=True, auto_upload_at=now_str(),
+                  auto_next_at=str(int(time.time())), **_notify_target(ev))
         await bot.send(
             ev, "✅ 已开启自动上传成绩\n" + _auto_upload_status_text(rec, True), at_sender=True
         )
@@ -666,19 +761,14 @@ def _auto_report_ok(results: dict) -> bool:
     return bool(active) and all(v.get("ok") for v in active)
 
 
-async def _run_auto_upload(qq, rec: dict) -> tuple:
-    """给一个用户执行一次自动上传，返回 (是否成功, 可直接发给用户的结果文本)。"""
+async def _push_scores(qq, score_list, summary, title: str) -> tuple:
+    """把已拉取的成绩上传到水鱼 / 落雪，返回 (是否全部成功, 结果文本)。"""
     proxy = _proxy()
-
     df_on = bool(dfconfig.oauth_enabled)
-
     lx_token, _ = await _lxns_valid_token(qq)
-    lx_on = bool(lx_token)
-
-    if not df_on and not lx_on:
+    if not df_on and not lx_token:
         return False, "⚠ 未完成任何上传平台授权（水鱼 / 落雪），本次跳过"
 
-    score_list, summary = await fetch_scores(rec.get("arcade_creds"), proxy)
     results = await upload_scores(
         score_list,
         qq,
@@ -688,7 +778,7 @@ async def _run_auto_upload(qq, rec: dict) -> tuple:
     if isinstance(results, dict) and "error" in results:
         return False, f"⚠ 未上传：{results.get('error')}"
 
-    lines = [f"⏰ 自动上传结果（每天 {_AUTO_UPLOAD_TIME}）"]
+    lines = [title]
     if isinstance(summary, dict):
         if summary.get("score_count") is not None:
             lines.append(f"共 {summary.get('score_count')} 条成绩")
@@ -703,6 +793,44 @@ async def _run_auto_upload(qq, rec: dict) -> tuple:
     lines.append(_auto_platform_line("落雪", "lxns", results))
     lines.append("（不想再自动上传：发送「自动上传成绩」关闭）")
     return _auto_report_ok(results), "\n".join(lines)
+
+
+async def _auto_probe(qq, rec: dict, *, force: bool = False) -> tuple:
+    """探测一次机台成绩：有变化（或 force=True）才上传。
+
+    返回 (changed, ok, text)；没有变化时 text 为空串，调用方无需发消息。
+    """
+    proxy = _proxy()
+    df_on = bool(dfconfig.oauth_enabled)
+    lx_token, _ = await _lxns_valid_token(qq)
+    if not df_on and not lx_token:
+        return False, False, "⚠ 未完成任何上传平台授权（水鱼 / 落雪），本次跳过"
+
+    score_list, summary = await fetch_scores(rec.get("arcade_creds"), proxy)
+    digest = _scores_hash(score_list)
+    old = rec.get("auto_hash")
+    changed = force or (old != digest)
+    if not changed:
+        return False, True, ""
+
+    title = (
+        f"⏰ 自动上传结果（{_AUTO_UPLOAD_TIME} 兜底全量）"
+        if force
+        else "🔔 探测到成绩变化，已自动上传"
+    )
+    ok, text = await _push_scores(qq, score_list, summary, title)
+    if ok:
+        try:
+            set(qq, auto_hash=digest)
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"[mai_upload] 成绩指纹落盘失败 qq={qq}：{e}")
+    return True, ok, text
+
+
+async def _run_auto_upload(qq, rec: dict) -> tuple:
+    """整体上传一次（每日兜底 / 手动触发），返回 (是否成功, 结果文本)。"""
+    _changed, ok, text = await _auto_probe(qq, rec, force=True)
+    return ok, text
 
 
 async def _notify_auto_upload(qq, rec: dict, text: str) -> None:
@@ -735,23 +863,83 @@ async def _notify_auto_upload(qq, rec: dict, text: str) -> None:
         log.warning(f"[mai_upload] 自动上传结果群内兜底失败 qq={qq}：{e}")
 
 
+def _auto_targets() -> list:
+    """所有「已开启自动上传且有凭据」的用户 [(qq, rec), ...]（快照，避免边遍历边改）。"""
+    return [
+        (str(qq), rec)
+        for qq, rec in list(store_all().items())
+        if isinstance(rec, dict) and rec.get("auto_upload") and rec.get("arcade_creds")
+    ]
+
+
+async def _auto_save_schedule(qq, rec: dict, changed: bool, ok: bool) -> None:
+    """把下一次探测时间 / 分层 / 失败退避写回存储（写失败不影响主流程）。"""
+    try:
+        set(qq, **_auto_schedule(rec, time.time(), changed, ok))
+    except Exception as e:  # noqa: BLE001
+        log.warning(f"[mai_upload] 自动更新状态落盘失败 qq={qq}：{e}")
+
+
+@sv.scheduled_job("cron", minute=f"*/{AUTO_TICK_MINUTES}")
+async def auto_update_tick():
+    """探测式自动更新心跳：每 5 分钟看一次谁到期，探测到成绩变化才上传。
+
+    对应 maimai-score-hub auto-update 的 Rival Score Probe：
+    先探测、diff 只用于判断是否触发，触发后再整体上传到水鱼 / 落雪。
+    """
+    if not _core_ok:
+        return
+    try:
+        records = _auto_targets()
+    except Exception as e:  # noqa: BLE001
+        log.error(f"[mai_upload] 读取绑定记录失败，自动更新心跳结束：{e}")
+        return
+
+    now = time.time()
+    due = [(qq, rec) for qq, rec in records if _auto_due(rec, now)]
+    if not due:
+        return
+    log.info(f"[mai_upload] 自动更新探测：{len(due)} / {len(records)} 个用户到期")
+    for qq, rec in due:
+        if not _acquire(qq):
+            log.info(f"[mai_upload] 自动更新跳过 qq={qq}（该用户有操作正在进行）")
+            continue
+        changed = ok = False
+        text = ""
+        try:
+            changed, ok, text = await _auto_probe(qq, rec)
+        except Exception as e:  # noqa: BLE001
+            ok, text = False, f"❌ 自动更新失败：{_friendly_error(e)}"
+            log.warning(f"[mai_upload] 自动更新探测异常 qq={qq}：{e}")
+        finally:
+            _release(qq)
+        await _auto_save_schedule(qq, rec, changed, ok)
+        log.info(f"[mai_upload] 自动更新探测完成 qq={qq} changed={changed} ok={ok}")
+        if text:
+            try:
+                await _notify_auto_upload(qq, rec, text)
+            except Exception as e:  # noqa: BLE001
+                log.warning(f"[mai_upload] 自动更新结果发送异常 qq={qq}：{e}")
+        await asyncio.sleep(1)
+
+
 @sv.scheduled_job("cron", hour=AUTO_UPLOAD_HOUR, minute=AUTO_UPLOAD_MINUTE)
 async def auto_upload_job():
-    """每天 03:50（Asia/Shanghai）给所有开启开关的用户跑一次自动上传。"""
+    """每天 03:50（Asia/Shanghai）兜底：给所有开启开关的用户整体上传一次。
+
+    对应 score-hub 的 Daily Full Update —— 探测式更新可能漏掉 FC/FS 之类
+    没有体现在成绩数字上的变化，每天固定再整体同步一次收尾。
+    """
     if not _core_ok:
         log.warning("[mai_upload] core 未就绪，自动上传任务跳过")
         return
     try:
-        records = [
-            (qq, rec)
-            for qq, rec in list(store_all().items())
-            if isinstance(rec, dict) and rec.get("auto_upload") and rec.get("arcade_creds")
-        ]
+        records = _auto_targets()
     except Exception as e:  # noqa: BLE001
         log.error(f"[mai_upload] 读取绑定记录失败，自动上传任务结束：{e}")
         return
 
-    log.info(f"[mai_upload] 自动上传开始，共 {len(records)} 个用户")
+    log.info(f"[mai_upload] 每日兜底上传开始，共 {len(records)} 个用户")
     for qq, rec in records:
         if not _acquire(qq):
             log.warning(f"[mai_upload] 自动上传跳过 qq={qq}（该用户有操作正在进行）")
@@ -764,6 +952,7 @@ async def auto_upload_job():
             log.warning(f"[mai_upload] 自动上传异常 qq={qq}：{e}")
         finally:
             _release(qq)
+        await _auto_save_schedule(qq, rec, False, ok)
         try:
             await _notify_auto_upload(qq, rec, text)
         except Exception as e:  # noqa: BLE001
