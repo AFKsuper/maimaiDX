@@ -7,7 +7,7 @@
 - mai绑定状态 —— 机台凭据 + 水鱼/落雪授权状态（凭据脱敏）
 - mai上传 —— 拉取机台成绩并上传到已设置平台
 - 自动上传成绩 —— 开关探测式自动更新（每人独立，重发即切换开/关）
-  成绩有变化才上传（hot/warm/cold 分层探测），每天 03:50 兜底整体同步一次
+  成绩有变化才上传（hot/warm/cold 分层探测）
 
 【功能来源】「探测式自动更新」的设计参考自开源项目 maimai-score-hub
 （https://github.com/bakapiano/maimai-score-hub ，作者 bakapiano）
@@ -134,7 +134,7 @@ SV_HELP = """【maimaiDX 舞萌成绩上传】
 4. mai上传 —— 拉取机台成绩并上传到已设置平台
 5. 自动上传成绩 —— 开关探测式自动更新（重发即切换）
    成绩有变化才上传（刚变化 15 分钟 / 近期 30 分钟 / 平时 60 分钟探测一次）
-   每天 03:50 再兜底整体同步一次；自动上传成绩 开 / 关 / 状态
+   自动上传成绩 开 / 关 / 状态
 mai帮助 查看本帮助"""
 
 # ============================================================
@@ -577,11 +577,6 @@ async def upload_cmd(bot: NoneBot, ev: CQEvent):
 # 主探测改用「完整成绩指纹」。
 # ============================================================
 
-AUTO_UPLOAD_HOUR = 3
-AUTO_UPLOAD_MINUTE = 50
-_AUTO_UPLOAD_TIME = f"{AUTO_UPLOAD_HOUR:02d}:{AUTO_UPLOAD_MINUTE:02d}"
-
-# —— 探测式自动更新：先探测、有变化才写（分层间隔 15/30/60 分钟，失败退避）——
 AUTO_TICK_MINUTES = 5                                   # 调度心跳：每 5 分钟看谁到期
 AUTO_PROBE_MINUTES = {"hot": 15, "warm": 30, "cold": 60}  # 活跃分层探测间隔
 AUTO_HOT_MINUTES = 120                                  # 探测到变化后 2 小时内按 hot
@@ -600,8 +595,7 @@ def _auto_upload_usage() -> str:
         "· 自动上传成绩 开（或 关）\n"
         "· 自动上传成绩 状态\n"
         "开启后机器人会定期探测机台成绩，**发现成绩有变化才上传**"
-        "（刚有变化 15 分钟一次 / 近期 30 分钟 / 平时 1 小时），"
-        f"另外每天 {_AUTO_UPLOAD_TIME} 兜底整体上传一次。"
+        "（刚有变化 15 分钟一次 / 近期 30 分钟 / 平时 1 小时）。"
     )
 
 
@@ -701,7 +695,6 @@ def _auto_upload_status_text(rec: dict, on: bool) -> str:
         lines.append(f"下次探测：{_fmt_ts(rec.get('auto_next_at'))}")
         if rec.get("auto_fail"):
             lines.append(f"⚠ 连续失败 {rec.get('auto_fail')} 次（已自动退避重试）")
-        lines.append(f"兜底全量：每天 {_AUTO_UPLOAD_TIME} 再整体上传一次")
         group_id = rec.get("auto_upload_group") or ""
         if group_id:
             lines.append(f"结果通知：先私聊；私聊失败时在群 {group_id} 里 @ 你")
@@ -815,8 +808,8 @@ async def _push_scores(qq, score_list, summary, title: str) -> tuple:
     return _auto_report_ok(results), "\n".join(lines)
 
 
-async def _auto_probe(qq, rec: dict, *, force: bool = False) -> tuple:
-    """探测一次机台成绩：有变化（或 force=True）才上传。
+async def _auto_probe(qq, rec: dict) -> tuple:
+    """探测一次机台成绩：**有变化才上传**。
 
     返回 (changed, ok, text)；没有变化时 text 为空串，调用方无需发消息。
     """
@@ -828,29 +821,16 @@ async def _auto_probe(qq, rec: dict, *, force: bool = False) -> tuple:
 
     score_list, summary = await fetch_scores(rec.get("arcade_creds"), proxy)
     digest = _scores_hash(score_list)
-    old = rec.get("auto_hash")
-    changed = force or (old != digest)
-    if not changed:
+    if rec.get("auto_hash") == digest:
         return False, True, ""
 
-    title = (
-        f"⏰ 自动上传结果（{_AUTO_UPLOAD_TIME} 兜底全量）"
-        if force
-        else "🔔 探测到成绩变化，已自动上传"
-    )
-    ok, text = await _push_scores(qq, score_list, summary, title)
+    ok, text = await _push_scores(qq, score_list, summary, "🔔 探测到成绩变化，已自动上传")
     if ok:
         try:
             set(qq, auto_hash=digest)
         except Exception as e:  # noqa: BLE001
             log.warning(f"[mai_upload] 成绩指纹落盘失败 qq={qq}：{e}")
     return True, ok, text
-
-
-async def _run_auto_upload(qq, rec: dict) -> tuple:
-    """整体上传一次（每日兜底 / 手动触发），返回 (是否成功, 结果文本)。"""
-    _changed, ok, text = await _auto_probe(qq, rec, force=True)
-    return ok, text
 
 
 async def _notify_auto_upload(qq, rec: dict, text: str) -> None:
@@ -940,43 +920,6 @@ async def auto_update_tick():
                 await _notify_auto_upload(qq, rec, text)
             except Exception as e:  # noqa: BLE001
                 log.warning(f"[mai_upload] 自动更新结果发送异常 qq={qq}：{e}")
-        await asyncio.sleep(1)
-
-
-@sv.scheduled_job("cron", hour=AUTO_UPLOAD_HOUR, minute=AUTO_UPLOAD_MINUTE)
-async def auto_upload_job():
-    """每天 03:50（Asia/Shanghai）兜底：给所有开启开关的用户整体上传一次。
-
-    对应 score-hub 的 Daily Full Update —— 探测式更新可能漏掉 FC/FS 之类
-    没有体现在成绩数字上的变化，每天固定再整体同步一次收尾。
-    """
-    if not _core_ok:
-        log.warning("[mai_upload] core 未就绪，自动上传任务跳过")
-        return
-    try:
-        records = _auto_targets()
-    except Exception as e:  # noqa: BLE001
-        log.error(f"[mai_upload] 读取绑定记录失败，自动上传任务结束：{e}")
-        return
-
-    log.info(f"[mai_upload] 每日兜底上传开始，共 {len(records)} 个用户")
-    for qq, rec in records:
-        if not _acquire(qq):
-            log.warning(f"[mai_upload] 自动上传跳过 qq={qq}（该用户有操作正在进行）")
-            continue
-        try:
-            ok, text = await _run_auto_upload(qq, rec)
-            log.info(f"[mai_upload] 自动上传完成 qq={qq} ok={ok}")
-        except Exception as e:  # noqa: BLE001
-            ok, text = False, f"❌ 自动上传失败：{_friendly_error(e)}"
-            log.warning(f"[mai_upload] 自动上传异常 qq={qq}：{e}")
-        finally:
-            _release(qq)
-        await _auto_save_schedule(qq, rec, False, ok)
-        try:
-            await _notify_auto_upload(qq, rec, text)
-        except Exception as e:  # noqa: BLE001
-            log.warning(f"[mai_upload] 自动上传结果发送异常 qq={qq}：{e}")
         await asyncio.sleep(1)
 
 
