@@ -21,7 +21,12 @@ https://github.com/bakapiano/maimai-score-hub/tree/main/docs/specs/auto-update
 
 - mai帮助 —— 查看本帮助
 
-隐私：mai绑定 的回复会提醒用户撤回消息。
+隐私：
+- 检测到 SGWCMAID 内容（文本或二维码图片）时，机器人在群里若是管理员会先替用户
+  撤回该消息；撤回失败或不是管理员，才在回复里提示用户自己撤回。
+- 群里裸发的普通图片（不是舞萌二维码）静默跳过，不打扰群聊；
+  私聊裸发图片则会提示「二维码内容识别失败」。
+- mai上传 的「⏳ 正在拉取成绩并上传…」在结果返回后自动撤回，避免刷屏。
 
 授权复用 maimaiDX 现有 OAuth 流程（dfbind / lxbind / 水鱼授权码 / 落雪授权码），
 本模块不搬 mai绑定水鱼 / mai绑定落雪，也不提供手动 Import-Token / API-Secret
@@ -211,6 +216,73 @@ def _recall_hint(what: str = "二维码") -> str:
     )
 
 
+async def _recall_msg(bot: NoneBot, ev: CQEvent, message_id) -> bool:
+    """撤回一条消息。成功 True；无权限 / 超时 / 私聊撤回对方消息时 False。"""
+    if not message_id:
+        return False
+    try:
+        await bot.delete_msg(self_id=ev.self_id, message_id=int(message_id))
+        return True
+    except Exception as e:  # noqa: BLE001
+        log.info(f"[mai_upload] 撤回消息 {message_id} 失败（{type(e).__name__}: {e}）")
+        return False
+
+
+async def _privacy_tail(bot: NoneBot, ev: CQEvent, what: str = "二维码") -> str:
+    """检测到含 SGWCMAID 的内容后：机器人在群里是管理员就先替用户撤回，
+    撤回失败（或不是管理员）再提示用户自己撤回；私聊撤不了对方消息，直接提示。"""
+    if ev.detail_type == "group" and await _recall_msg(bot, ev, ev.message_id):
+        return ""
+    return _recall_hint(what)
+
+
+def _is_sg_content(content) -> bool:
+    """内容是否为舞萌机台二维码代码（SGWCMAID 开头）。"""
+    if not content:
+        return False
+    return str(content).lstrip().upper().startswith("SGWCMAID")
+
+
+# 裸发兜底只处理「像一张二维码截图」的消息：恰好一张图，且没有长文本。
+# 目的是别把群里所有图片（表情包、聊天截图、长文配图）都下载一遍解码。
+# 私聊是一对一，没有刷屏顾虑，只要含图片就过。
+_BARE_TEXT_MAX = 30
+
+
+def _has_image(ev: CQEvent) -> bool:
+    """消息里是否含图片段（私聊裸发兜底用）。"""
+    try:
+        return any(seg.type == "image" for seg in ev.message)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _looks_like_bare_qr(ev: CQEvent) -> bool:
+    """群内裸发兜底的准入判断：恰好一张图片，且纯文本很短（或没有）。"""
+    try:
+        segs = list(ev.message)
+    except Exception:  # noqa: BLE001
+        return False
+    if sum(1 for s in segs if s.type == "image") != 1:
+        return False
+    try:
+        text = ev.message.extract_plain_text().strip()
+    except Exception:  # noqa: BLE001
+        text = ""
+    return len(text) <= _BARE_TEXT_MAX
+
+
+# 本插件的命令前缀（兜底识别时用来跳过带命令的消息，避免与命令处理器重复响应）
+_COMMAND_PREFIXES = (
+    "mai绑定",
+    "舞萌上传绑定",
+    "mai上传",
+    "自动上传成绩",
+    "mai自动上传",
+    "mai帮助",
+)
+
+
 # ============================================================
 # 图片加载（QQ 图片 url 易过期，找到就尽快下载；兜底读本机缓存文件）
 # ============================================================
@@ -321,13 +393,38 @@ async def _lxns_token_state(qq) -> Optional[str]:
 # 命令一：绑定（二维码 → 机台凭据）
 # ============================================================
 
-async def _handle_bind(bot: NoneBot, ev: CQEvent) -> None:
+_BARE_FAIL_TEXT = (
+    "二维码内容识别失败：这不是 SGWCMAID 开头的舞萌机台二维码。\n"
+    "请尝试使用 SGWCMAID 开头的二维码代码"
+    "（机台二维码文本，或 mai绑定 + 舞萌二维码图片）。"
+)
+
+
+async def _handle_bind(bot: NoneBot, ev: CQEvent, bare: bool = False) -> None:
+    """绑定机台账号。
+
+    bare=True 表示「裸发」场景（用户没带 mai绑定 前缀，直接丢图片/文本）：
+    · 群里 —— 识别不出舞萌二维码就静默跳过，不打扰群聊；
+    · 私聊 —— 提示「二维码内容识别失败」并引导改用 SGWCMAID 代码。
+    一旦识别出 SGWCMAID 内容，成功/失败照常反馈。
+    """
     qq = ev.user_id
+    is_private = ev.detail_type == "private"
+
+    async def _fail(text: str) -> None:
+        """裸发场景下按会话类型决定要不要出声：群里静默、私聊提示。"""
+        if bare and not is_private:
+            return
+        await bot.send(ev, text, at_sender=True)
+
     if not _acquire(qq):
-        await bot.send(ev, "⏳ 上一个操作还在进行中，请稍候再试。", at_sender=True)
+        if not bare:
+            await bot.send(ev, "⏳ 上一个操作还在进行中，请稍候再试。", at_sender=True)
         return
     try:
         if not _core_ok:
+            if bare:
+                return  # 裸发兜底：依赖没就绪时静默，别刷屏
             await bot.send(
                 ev,
                 _setup_hint("core.arcade_qr / core.arcade_store / core.uploader 模块") + _recall_hint(),
@@ -350,6 +447,9 @@ async def _handle_bind(bot: NoneBot, ev: CQEvent) -> None:
         if content is None:
             data = await _load_image_bytes(ev)
             if data is None:
+                if bare:
+                    await _fail(_BARE_FAIL_TEXT)
+                    return
                 await bot.send(
                     ev,
                     "没有识别到二维码。\n"
@@ -361,6 +461,9 @@ async def _handle_bind(bot: NoneBot, ev: CQEvent) -> None:
             loop = asyncio.get_running_loop()
             content = await loop.run_in_executor(None, decode_image, data)
             if content is None:
+                if bare:
+                    await _fail(_BARE_FAIL_TEXT)  # 群里静默；私聊提示识别失败
+                    return
                 await bot.send(
                     ev,
                     "二维码图片解码失败：请发更清晰的原图，"
@@ -369,11 +472,25 @@ async def _handle_bind(bot: NoneBot, ev: CQEvent) -> None:
                 )
                 return
 
+        # 内容校验：只认 SGWCMAID 开头的舞萌机台二维码
+        # 裸发场景：群里静默跳过（不打扰群聊）；私聊才提示识别失败
+        if not _is_sg_content(content):
+            await _fail(_BARE_FAIL_TEXT)
+            return
+
+        # 已确认是舞萌机台二维码 —— 立刻处理隐私：机器人是群管理员就先替用户撤回，
+        # 撤不掉再在回复里提示（不等 bind_arcade 联网，越早撤回越安全）
+        privacy_tail = await _privacy_tail(bot, ev)
+
         # 调 core 完成绑定并落库
         try:
             creds = await bind_arcade(content, _proxy())
         except Exception as e:  # noqa: BLE001
-            await bot.send(ev, f"❌ 绑定失败：{_friendly_error(e)}" + _recall_hint(), at_sender=True)
+            await bot.send(
+                ev,
+                f"❌ 绑定失败：{_friendly_error(e)}" + privacy_tail,
+                at_sender=True,
+            )
             return
 
         set(qq, arcade_creds=creds, bound_at=now_str())
@@ -381,7 +498,7 @@ async def _handle_bind(bot: NoneBot, ev: CQEvent) -> None:
             ev,
             "✅ 已绑定机台账号\n"
             "凭据已保存，后续上传无需再扫码\n"
-            f"凭据：{mask(creds)}" + _recall_hint(),
+            f"凭据：{mask(creds)}" + privacy_tail,
             at_sender=True,
         )
     finally:
@@ -397,6 +514,23 @@ async def bind_cmd(bot: NoneBot, ev: CQEvent):
 async def bind_raw_qr(bot: NoneBot, ev: CQEvent):
     # 用户直接裸发以 SGWCMAID 开头的二维码文本（不带命令前缀）
     await _handle_bind(bot, ev)
+
+
+@sv.on_message()
+async def bare_image_qr(bot: NoneBot, ev: CQEvent) -> None:
+    """群内裸发图片的兜底识别。
+
+    用户直接丢一张机台二维码图片、不带 mai绑定 前缀时，前缀/正则触发器都不会命中
+    （首段不是文本），这里补一条兜底：能解出 SGWCMAID 就照常绑定，
+    解不出（普通图片、别的二维码）就静默跳过，不打扰群聊。
+    """
+    if not _core_ok or not _looks_like_bare_qr(ev):
+        return
+    text = ev.message.extract_plain_text().strip()
+    # 带命令前缀、或本身就是 SGWCMAID 文本：交给对应触发器，避免重复响应
+    if text.startswith(_COMMAND_PREFIXES) or _is_sg_content(text):
+        return
+    await _handle_bind(bot, ev, bare=True)
 
 
 # ============================================================
@@ -516,12 +650,18 @@ async def _handle_upload(bot: NoneBot, ev: CQEvent) -> None:
             )
             return
 
-        # 拉取较慢，先回一句再执行
-        await bot.send(ev, "⏳ 正在拉取成绩并上传…", at_sender=True)
+        # 拉取较慢，先回一句再执行（无论成功失败，结束时都撤回这句，避免刷屏）
+        progress = await bot.send(ev, "⏳ 正在拉取成绩并上传…", at_sender=True)
+        progress_id = progress.get("message_id") if isinstance(progress, dict) else None
+
+        async def _drop_progress() -> None:
+            if progress_id:
+                await _recall_msg(bot, ev, progress_id)
 
         try:
             score_list, summary = await fetch_scores(creds, proxy)
         except Exception as e:  # noqa: BLE001
+            await _drop_progress()
             await bot.send(ev, f"❌ 拉取成绩失败：{_friendly_error(e)}", at_sender=True)
             return
 
@@ -533,11 +673,13 @@ async def _handle_upload(bot: NoneBot, ev: CQEvent) -> None:
                 http_proxy=proxy,
             )
         except Exception as e:  # noqa: BLE001
+            await _drop_progress()
             await bot.send(ev, f"❌ 上传失败：{_friendly_error(e)}", at_sender=True)
             return
 
         # core 在成绩列表为空等情况下返回 {"error": "..."}（键 error，而非平台结果）
         if isinstance(results, dict) and "error" in results:
+            await _drop_progress()
             await bot.send(ev, f"⚠ 未上传：{results.get('error')}", at_sender=True)
             return
 
@@ -555,6 +697,7 @@ async def _handle_upload(bot: NoneBot, ev: CQEvent) -> None:
         lines.append("—— 上传结果 ——")
         lines.append(_platform_line("水鱼", df_on, results, df_skip))
         lines.append(_platform_line("落雪", lx_on, results, lx_skip))
+        await _drop_progress()
         await bot.send(ev, "\n".join(lines), at_sender=True)
     finally:
         _release(qq)
@@ -992,3 +1135,29 @@ async def _private_dispatch(session: NLPSession) -> None:
     elif text.startswith("mai帮助"):
         await _handle_help(bot, ev, private=True)
     # 其它只是碰巧含关键词的消息（如英文句子带 mai）：什么都不做，直接放行
+
+
+@on_natural_language(
+    keywords=None,            # 不靠关键词：图片消息没有文本，兜底全过一遍
+    only_to_me=False,
+    only_short_message=False,
+    allow_empty_message=True,
+)
+async def _private_bare_image(session: NLPSession) -> None:
+    """私聊裸发图片的兜底识别。
+
+    私聊直接丢一张图片（不带 mai绑定 前缀）时，_private_dispatch 的关键词是子串
+    匹配纯文本，图片消息匹配不上，这里补一条兜底：解出 SGWCMAID 就照常绑定，
+    解不出（普通图片、别的二维码）就提示「二维码内容识别失败」。
+    群里不提示——群内裸发图片由 bare_image_qr 静默处理。
+    """
+    ev = session.event
+    if ev.detail_type != "private":
+        return
+    if not _has_image(ev):
+        return
+    text = ev.message.extract_plain_text().strip()
+    # 带命令前缀、或本身就是 SGWCMAID 文本：交给 _private_dispatch，避免重复响应
+    if text.startswith(_COMMAND_PREFIXES) or _is_sg_content(text):
+        return
+    await _handle_bind(session.bot, ev, bare=True)
