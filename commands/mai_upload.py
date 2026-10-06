@@ -8,6 +8,17 @@
 - mai上传 —— 拉取机台成绩并上传到已设置平台
 - 自动上传成绩 —— 开关探测式自动更新（每人独立，重发即切换开/关）
   成绩有变化才上传（hot/warm/cold 分层探测），每天 03:50 兜底整体同步一次
+
+【功能来源】「探测式自动更新」的设计参考自开源项目 maimai-score-hub
+（https://github.com/bakapiano/maimai-score-hub ，作者 bakapiano）
+的 backend/src/modules/auto-update 模块，设计文档见
+https://github.com/bakapiano/maimai-score-hub/tree/main/docs/specs/auto-update
+其核心思想是 Rival-first：先用 GetUserRivalMusicApi 探测成绩是否有变化，
+有变化才写入（diff 只用于探测、不用于写入），并按活跃度分层探测。
+本项目未使用该项目任何代码（其 sdgb 部分闭源），仅按公开设计做了等价实现：
+因 maimai-ffi 未暴露 GetUserRivalMusicApi（rivalId 解析在其闭源部分），
+本插件改用完整成绩指纹（achievement / dxScore / FC / FS）作为变化判据。
+
 - mai帮助 —— 查看本帮助
 
 隐私：mai绑定 的回复会提醒用户撤回消息。
@@ -555,14 +566,22 @@ async def upload_cmd(bot: NoneBot, ev: CQEvent):
 
 
 # ============================================================
-# 命令四：自动上传成绩（每人独立开关，由机器人进程每天定时执行）
+# 命令四：自动上传成绩（每人独立开关，由机器人进程定时执行）
+#
+# 【功能来源】探测式自动更新的设计参考 maimai-score-hub（作者 bakapiano）：
+#   https://github.com/bakapiano/maimai-score-hub
+#   · 模块：backend/src/modules/auto-update
+#   · 文档：docs/specs/auto-update/README.md（Rival-first：先探测、有变化才写入）
+# 本项目未复制其任何代码（其 sdgb 部分闭源），只按公开设计做等价实现：
+# 因 maimai-ffi 未暴露 GetUserRivalMusicApi（rivalId 解析在闭源部分），
+# 主探测改用「完整成绩指纹」。
 # ============================================================
 
 AUTO_UPLOAD_HOUR = 3
 AUTO_UPLOAD_MINUTE = 50
 _AUTO_UPLOAD_TIME = f"{AUTO_UPLOAD_HOUR:02d}:{AUTO_UPLOAD_MINUTE:02d}"
 
-# —— 探测式自动更新（参考 maimai-score-hub 的 auto-update：先探测、有变化才写）——
+# —— 探测式自动更新：先探测、有变化才写（分层间隔 15/30/60 分钟，失败退避）——
 AUTO_TICK_MINUTES = 5                                   # 调度心跳：每 5 分钟看谁到期
 AUTO_PROBE_MINUTES = {"hot": 15, "warm": 30, "cold": 60}  # 活跃分层探测间隔
 AUTO_HOT_MINUTES = 120                                  # 探测到变化后 2 小时内按 hot
@@ -675,6 +694,7 @@ def _auto_upload_status_text(rec: dict, on: bool) -> str:
             "cold": "cold（平时，1 小时探测一次）",
         }[tier]
         lines.append("模式：探测式自动更新（成绩有变化才上传）")
+        lines.append("来源：思路参考开源项目 maimai-score-hub 的 auto-update")
         lines.append(f"活跃分层：{tier_name}")
         lines.append(f"上次探测：{rec.get('auto_checked_at') or '尚未探测'}")
         lines.append(f"上次发现变化：{_fmt_ts(rec.get('auto_changed_at'))}")

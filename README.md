@@ -127,6 +127,8 @@
 
 将独立插件 `maimai-update` 的成绩上传能力融入本插件，直接在群里完成机台绑定与成绩上传。
 
+> 来源说明：**自动更新（探测式上传）** 的设计参考自开源项目 **[bakapiano/maimai-score-hub](https://github.com/bakapiano/maimai-score-hub)** 的 `backend/src/modules/auto-update` 模块（设计文档 [`docs/specs/auto-update`](https://github.com/bakapiano/maimai-score-hub/tree/main/docs/specs/auto-update)）——即"先探测成绩是否有变化，有变化才写入"的 Rival-first 思路。本插件按其公开设计做了等价实现（该项目的 sdgb 部分闭源，本插件未使用其任何闭源代码；探测方式为完整成绩指纹，详见下文说明）。
+
 **命令**
 
 | 命令 | 说明 |
@@ -146,7 +148,7 @@
 > 水鱼写入需要 `DIVINGFISH_SCOPE` 包含 `prober.records.write`，该写入权限需要水鱼应用过审；修改 scope 后必须重新发送 `dfbind` 重授权。未过审或 scope 不足时 `mai上传` 会回报水鱼侧错误。
 
 > [!NOTE]
-> **自动上传（探测式，参考 maimai-score-hub 的 auto-update 思路）**：开启后按活跃度分层探测机台成绩——刚发现变化后 15 分钟一次、12 小时内 30 分钟一次、之后 1 小时一次；**只有成绩指纹变化时才上传**（指纹只看 achievement / dxScore / FC / FS，不看游玩次数），没变化就不上传、也不发消息。每天 03:50 还会兜底整体同步一次，补上 FC/FS 这类不体现在数字上的变化。探测连续失败会自动退避（15→30→60→120 分钟）。结果优先私聊推送；若是在群里开启且私聊失败，会在该群 @ 你兜底。拉取/上传成绩如需代理，在 `.env` 设置 `MAI_HTTP_PROXY`。
+> **自动上传（探测式）**：设计参考 [bakapiano/maimai-score-hub](https://github.com/bakapiano/maimai-score-hub) 的 `auto-update` 模块（Rival-first：先探测、有变化才写入）。它的主探测用 `GetUserRivalMusicApi`，而 maimai-ffi 未暴露该接口（且其 rivalId 解析属闭源 sdgb 部分），因此本插件改用**完整成绩指纹**做探测。行为：开启后按活跃度分层探测机台成绩——刚发现变化后 15 分钟一次、12 小时内 30 分钟一次、之后 1 小时一次；**只有成绩指纹变化时才上传**（指纹只看 achievement / dxScore / FC / FS，不看游玩次数），没变化就不上传、也不发消息。每天 03:50 还会兜底整体同步一次，补上 FC/FS 这类不体现在数字上的变化。探测连续失败会自动退避（15→30→60→120 分钟）。结果优先私聊推送；若是在群里开启且私聊失败，会在该群 @ 你兜底。拉取/上传成绩如需代理，在 `.env` 设置 `MAI_HTTP_PROXY`。
 
 > [!TIP]
 > **隐私**：绑定成功或失败后请撤回你发出的二维码 / 凭据消息（机器人也会提示），避免账号凭据外泄。
