@@ -92,10 +92,13 @@
    # diving-fish                        # 水鱼查分器配置
    DIVINGFISH_CLIENT_ID=                # OAuth 应用ID，向水鱼申请应用后获得
    DIVINGFISH_CLIENT_SECRET=            # OAuth 应用秘钥
-   DIVINGFISH_SCOPE=""                  # OAuth 权限，根据应用权限进行填写，多个权限用空格隔开，默认值为 `"prober.profile.read"`
+   DIVINGFISH_SCOPE=profile prober.profile.read prober.records.read chunithm.records.read chunithm.records.write prober.records.write   # OAuth 权限，根据应用权限进行填写，多个权限用空格隔开，默认值为 `"prober.profile.read"`
    DIVINGFISH_AUTH_URL=                 # 水鱼账号地址，一般不需要填写，默认为 `https://auth.diving-fish.com`
    DIVINGFISH_TOKEN=                    # 开发者 token，已弃用，见下方说明
    DIVINGFISH_PROBER_PROXY=false        # 是否使用中转访问水鱼查分器，适用于境外服务器
+
+   # 成绩上传（拉取/上传成绩使用的 HTTP 代理，留空则直连，例如走本机隧道）
+   MAI_HTTP_PROXY=http://127.0.0.1:17890
 
    # lxns                               # 落雪查分器配置，均未填写将无法使用落雪查分器
    LXNS_DEV_TOKEN=                      # 开发者 token
