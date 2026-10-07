@@ -262,6 +262,34 @@ def _to_played(rec: Dict[str, Any]) -> Optional[PlayedResult]:
         return None
 
 
+def _in_local_library(song_id: int, level_index: int) -> bool:
+    """
+    本地曲库里是否有这张谱面。
+
+    渲染层（core/image/base.py 的 whiledraw）会 `mai.total_list.by_id(song_id)`
+    取谱面定数，取不到就是 None → `AttributeError`。缓存里可能存着本地曲库还没
+    同步到的新曲（曲库每天凌晨才刷新），所以兜底出图前先滤一遍。
+
+    曲库尚未加载时无法判定，返回 True 不滤（该场景由 cached_best50 提前拦下）。
+    """
+    try:
+        total_list = getattr(_mai(), "total_list", None)
+    except Exception:  # noqa: BLE001
+        return True
+    if total_list is None:
+        return True
+    try:
+        song = total_list.by_id(song_id)
+    except Exception:  # noqa: BLE001
+        return True
+    if song is None:
+        return False
+    try:
+        return any(d.level_index == LevelIndex(level_index) for d in song.difficulties)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _is_new(rec: Dict[str, Any]) -> bool:
     """按谱面版本号判断属于 B15（新曲）还是 B35（旧曲）。"""
     version = rec.get("version")
@@ -287,6 +315,7 @@ def build_best50(qq: Any) -> Optional[Tuple[Player, Best50, str]]:
 
     sd: List[PlayedResult] = []
     dx: List[PlayedResult] = []
+    skipped = 0
     for item in scores:
         if not isinstance(item, dict):
             continue
@@ -295,6 +324,9 @@ def build_best50(qq: Any) -> Optional[Tuple[Player, Best50, str]]:
         played = _to_played(item)
         if played is None:
             continue
+        if not _in_local_library(played.song_id, int(played.level_index)):
+            skipped += 1
+            continue  # 本地曲库还没有这张谱面，渲染会崩，直接跳过
         (dx if _is_new(item) else sd).append(played)
 
     if not sd and not dx:
@@ -317,8 +349,11 @@ def build_best50(qq: Any) -> Optional[Tuple[Player, Best50, str]]:
     saved_at = rec.get("saved_at") or rec.get("player_at") or "未知时间"
     note = (
         f"⚠ 在线查分器暂时不可用，以下为本地缓存成绩（缓存于 {saved_at}），可能不是最新。\n"
-        f"（共 {len(scores)} 条缓存成绩）\n"
+        f"（共 {len(scores)} 条缓存成绩"
     )
+    if skipped:
+        note += f"，其中 {skipped} 条本地曲库暂无数据已跳过"
+    note += "）\n"
     return player, Best50(sd_total=sd_total, dx_total=dx_total, sd=sd, dx=dx), note
 
 
