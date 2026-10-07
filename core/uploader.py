@@ -153,11 +153,37 @@ MSG_PRIVACY = "落雪新用户需先用落雪官方代理上传一次并同意�
 MSG_BAD_IDENTIFIER = "绑定凭据无效，请重新绑定"
 MSG_BAD_TOKEN = "token 已失效，请重新绑定"
 MSG_RATE = "接口限流，请稍后再试"
-# maimai-py 把 on-behalf-of 换票的 consent_required 翻译成 PlayerNotAuthorizedError
+# maimai-py 把 on-behalf-of 换票的 consent_required 翻译成 PlayerNotAuthorizedError。
+# 这句话按 .env 的 DIVINGFISH_SCOPE 是否含 prober.records.write 分流：
+# - 含写入 → 缺的只是用户本人授权，直接给绑定方法（dfbind）；
+# - 不含写入 → 用户怎么授权都传不上去，这句是给管理员的 .env 配置提示。
 MSG_OAUTH_NOT_AUTHORIZED = (
     "水鱼 OAuth 未完成授权或授权范围不含写入"
     "（.env 需在 DIVINGFISH_SCOPE 加 prober.records.write 并重新授权）"
 )
+MSG_OAUTH_BIND_GUIDE = (
+    "水鱼授权未完成。\n"
+    "请发送「dfbind」（或 水鱼授权码）完成授权，再重新发送 mai上传"
+    "（群聊、私聊均可）。\n"
+    "如果之前已经授权过仍失败，请联系机器人管理员："
+    ".env 的 DIVINGFISH_SCOPE 需包含 prober.records.write 且应用过审后重新授权。"
+)
+
+
+def _oauth_error_message() -> str:
+    """水鱼换票 consent_required 的提示：按 .env 的 scope 配置分流（见上两条注释）。
+
+    .env 配好了（应用凭据齐 + scope 含 prober.records.write）→ 缺的只是用户
+    自己发一次 dfbind，给绑定方法；没配好 → 用户做什么都没用，给管理员的 .env 提示。
+    """
+    try:
+        if dfconfig.oauth_enabled and (
+            "prober.records.write" in dfconfig.divingfish_oauth_scope
+        ):
+            return MSG_OAUTH_BIND_GUIDE
+    except Exception:  # noqa: BLE001 —— 配置对象异常时退回保守文案
+        pass
+    return MSG_OAUTH_NOT_AUTHORIZED
 
 _FAMILIES: Tuple[Tuple[Type[BaseException], str], ...] = tuple(
     (cls, msg)
@@ -169,8 +195,7 @@ _FAMILIES: Tuple[Tuple[Type[BaseException], str], ...] = tuple(
         (InvalidPlayerIdentifierError, MSG_BAD_IDENTIFIER),
         (InvalidDeveloperTokenError, MSG_BAD_TOKEN),
         (RateLimitError, MSG_RATE),
-        # 防御式追加：PlayerNotAuthorizedError 可能未导入成功（老版本 maimai_py 没有该类）
-        (PlayerNotAuthorizedError, MSG_OAUTH_NOT_AUTHORIZED),
+        # PlayerNotAuthorizedError 由 friendly_message 按 .env 配置分流处理，不在这里静态映射
     )
     if cls is not None
 )
@@ -181,6 +206,9 @@ def friendly_message(exc: BaseException) -> str:
     把任意异常翻译成可直接发给用户的中文提示。
     上层只需 `except Exception as e: msg = friendly_message(e)`，不要把堆栈裸抛给用户。
     """
+    # 水鱼 OAuth 未完成授权：文案按 .env 的 scope 配置分流，不走 _FAMILIES 静态映射
+    if PlayerNotAuthorizedError is not None and isinstance(exc, PlayerNotAuthorizedError):
+        return _oauth_error_message()
     for cls, msg in _FAMILIES:
         if isinstance(exc, cls):
             return msg
