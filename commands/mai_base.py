@@ -3,7 +3,7 @@ import re
 from re import Match
 
 from httpx import HTTPError as HTTPXError
-from nonebot import NoneBot
+from nonebot import NLPSession, NoneBot, on_natural_language
 from PIL import Image
 from pydantic import ValidationError
 from sqlalchemy.exc import SQLAlchemyError
@@ -165,7 +165,7 @@ async def _(bot: NoneBot, ev: CQEvent):
 
 
 @bind
-async def _(bot: NoneBot, ev: CQEvent):
+async def lxbind_cmd(bot: NoneBot, ev: CQEvent):
     user = await GetOrCreateSender(bot, ev)
     if not all(
         (
@@ -174,26 +174,29 @@ async def _(bot: NoneBot, ev: CQEvent):
             lxnsconfig.redirect_uri,
         )
     ):
-        await bot.finish(ev, LXNS_ERROR + "，无法进行绑定授权。", at_sender=True)
+        await bot.send(ev, LXNS_ERROR + "，无法进行绑定授权。", at_sender=True)
+        return
     text = ev.message.extract_plain_text().strip()
     if not text:
         pending_bindings.start(ev.self_id, ev.user_id, ServiceName.LXNS)
         await bot.send(ev, LXNS_AUTHORIZE_MSG, at_sender=True)
+        return
 
     code = extract_authorization_code(text)
     if code is None:
-        await bot.finish(ev, INVALID_CODE_MSG, at_sender=True)
+        await bot.send(ev, INVALID_CODE_MSG, at_sender=True)
+        return
 
     result, succeeded = await complete_lxns_binding(user, code)
     if succeeded:
         pending_bindings.discard(ev.self_id, ev.user_id)
     else:
         pending_bindings.start(ev.self_id, ev.user_id, ServiceName.LXNS)
-    await bot.finish(ev, result, at_sender=True)
+    await bot.send(ev, result, at_sender=True)
 
 
 @authcode
-async def _(bot: NoneBot, ev: CQEvent):
+async def lx_authcode_cmd(bot: NoneBot, ev: CQEvent):
     user = await GetOrCreateUser(bot, ev)
     args = ev.message.extract_plain_text().strip()
     code = extract_authorization_code(args)
@@ -208,30 +211,35 @@ async def _(bot: NoneBot, ev: CQEvent):
 
 
 @dfbind
-async def _(bot: NoneBot, ev: CQEvent):
+async def dfbind_cmd(bot: NoneBot, ev: CQEvent):
     user = await GetOrCreateSender(bot, ev)
     if not dfconfig.oauth_enabled:
-        await bot.finish(ev, DIVINGFISH_OAUTH_ERROR, at_sender=True)
+        await bot.send(ev, DIVINGFISH_OAUTH_ERROR, at_sender=True)
+        return
 
     text = ev.message.extract_plain_text().strip()
     if text:
         if not pending_bindings.is_active(
             ev.self_id, ev.user_id, ServiceName.DIVINGFISH
         ):
-            await bot.finish(ev, DIVINGFISH_NO_SESSION_MSG, at_sender=True)
+            await bot.send(ev, DIVINGFISH_NO_SESSION_MSG, at_sender=True)
+            return
         code = extract_confirmation_code(text)
         if code is None:
-            await bot.finish(ev, DIVINGFISH_INVALID_CODE_MSG, at_sender=True)
+            await bot.send(ev, DIVINGFISH_INVALID_CODE_MSG, at_sender=True)
+            return
         result, succeeded = await complete_divingfish(user.qqid, code)
         if succeeded:
             pending_bindings.consume(ev.self_id, ev.user_id)
-        await bot.finish(ev, result, at_sender=True)
+        await bot.send(ev, result, at_sender=True)
+        return
 
     try:
         authorization = await bind_divingfish(user.qqid)
     except (HTTPError, HTTPXError, UnknownError, ValidationError) as error:
         log.warning(f"水鱼授权发起失败：{type(error).__name__}")
-        await bot.finish(ev, DIVINGFISH_BIND_FAILED_MSG, at_sender=True)
+        await bot.send(ev, DIVINGFISH_BIND_FAILED_MSG, at_sender=True)
+        return
 
     pending_bindings.start(
         ev.self_id,
@@ -239,7 +247,7 @@ async def _(bot: NoneBot, ev: CQEvent):
         ServiceName.DIVINGFISH,
         ttl=DIVINGFISH_SESSION_TTL,
     )
-    await bot.finish(
+    await bot.send(
         ev,
         DIVINGFISH_AUTHORIZE_MSG.format(
             bot_name=maiconfig.bot_name,
@@ -253,18 +261,90 @@ async def _(bot: NoneBot, ev: CQEvent):
 
 
 @df_authcode
-async def _(bot: NoneBot, ev: CQEvent):
+async def df_authcode_cmd(bot: NoneBot, ev: CQEvent):
     user = await GetOrCreateUser(bot, ev)
     args = ev.message.extract_plain_text().strip()
     code = extract_confirmation_code(args)
     if code is None or not pending_bindings.is_active(
-        ev.self_id, ev.user_id, ServiceName.LXNS
+        ev.self_id, ev.user_id, ServiceName.DIVINGFISH
     ):
         return
     result, succeeded = await complete_divingfish(user.qqid, code)
     if succeeded:
         pending_bindings.consume(ev.self_id, ev.user_id)
     await bot.send(ev, result, at_sender=True)
+
+
+# ============================================================
+# 私聊绑定通道
+# Hoshino 只分发群消息（hoshino/msghandler.py:10 非 group 直接 return），
+# 私聊消息走不到上面的 sv 触发器。这里用 nonebot 自然语言处理器接住私聊，
+# 剥掉命令词后直接复用群里的绑定处理器，命令语义（含带码回填）与群内一致。
+# 群消息落进本处理器也会被 detail_type 判断立即放行，群开关/权限语义不变。
+# ============================================================
+
+# 前缀型命令：授权码/确认码回填（码跟在命令词后面）
+_OAUTH_PREFIX_COMMANDS = ("落雪授权码", "水鱼授权码", "lxcode", "dfcode")
+# 群内是 fullmatch；私聊按前缀放行，允许「lxbind 授权码」一条消息带回填
+_OAUTH_FULL_COMMANDS = ("dfbind", "绑定水鱼", "绑定df", "lxbind", "绑定落雪", "绑定lx")
+
+
+def _match_oauth_command(text: str) -> str | None:
+    for cmd in _OAUTH_PREFIX_COMMANDS + _OAUTH_FULL_COMMANDS:
+        if text.startswith(cmd):
+            return cmd
+    return None
+
+
+@on_natural_language(
+    keywords=_OAUTH_FULL_COMMANDS + _OAUTH_PREFIX_COMMANDS,
+    only_to_me=False,
+    only_short_message=False,  # 回调链接较长
+)
+async def _oauth_private_dispatch(session: NLPSession) -> None:
+    ev = session.event
+    if ev.detail_type != "private":
+        return
+    bot = session.bot
+    text = ev.message.extract_plain_text().strip()
+    cmd = _match_oauth_command(text)
+    if cmd is None:  # 只是句子里碰巧含关键词：放行
+        return
+    if ev.message and ev.message[0].type == "text":
+        ev.message[0].data["text"] = text[len(cmd):].lstrip()  # 模拟触发器剥命令
+    if cmd in ("落雪授权码", "lxcode"):
+        await lx_authcode_cmd(bot, ev)
+    elif cmd in ("水鱼授权码", "dfcode"):
+        await df_authcode_cmd(bot, ev)
+    elif cmd in ("lxbind", "绑定落雪", "绑定lx"):
+        await lxbind_cmd(bot, ev)
+    else:
+        await dfbind_cmd(bot, ev)
+
+
+@on_natural_language(
+    keywords=None,            # 裸码没有关键词可匹配，兜底过一遍
+    only_to_me=False,
+    only_short_message=False,
+    allow_empty_message=True,
+)
+async def _oauth_private_bare_code(session: NLPSession) -> None:
+    """私聊直接裸发授权码/回调链接（绑定引导语就是这么教的）。
+
+    只在「这个用户此刻确实有绑定会话在等码」时出手，其余私聊消息一律放行；
+    会话本身按 (self_id, user_id) 记，别人的码落不到这条记录上。
+    """
+    ev = session.event
+    if ev.detail_type != "private":
+        return
+    text = ev.message.extract_plain_text().strip()
+    if not text or _match_oauth_command(text):
+        return  # 带命令词的走上面的处理器
+    service = pending_bindings.active(ev.self_id, ev.user_id)
+    if service == ServiceName.LXNS and extract_authorization_code(text):
+        await lx_authcode_cmd(session.bot, ev)
+    elif service == ServiceName.DIVINGFISH and extract_confirmation_code(text):
+        await df_authcode_cmd(session.bot, ev)
 
 
 @source

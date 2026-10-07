@@ -134,7 +134,7 @@ SV_HELP = """【maimaiDX 舞萌成绩上传】
 2. 上传授权（OAuth，授权复用本插件现有绑定）：
    水鱼：发送 dfbind（或 水鱼授权码）完成授权
    落雪：发送 lxbind（或 落雪授权码）完成授权
-   （授权命令只能在群里发送）
+   （群聊、私聊均可发送）
 3. mai绑定状态 —— 查看绑定情况（凭据脱敏）
 4. mai上传 —— 拉取机台成绩并上传到已设置平台
 5. 自动上传成绩 —— 开关探测式自动更新（重发即切换）
@@ -645,7 +645,7 @@ async def _handle_upload(bot: NoneBot, ev: CQEvent) -> None:
                 "⚠ 还未完成任何平台的上传授权，没有可上传的目标平台。\n"
                 "· 水鱼：发送 dfbind（或 水鱼授权码）；需 .env 配置 DIVINGFISH_CLIENT_ID/SECRET\n"
                 "· 落雪：发送 lxbind（或 落雪授权码）；需 .env 配置 LX_CLIENT_ID/SECRET\n"
-                "（授权命令只能在群里发送）授权后重发 mai上传。",
+                "（群聊或私聊发送均可）授权后重发 mai上传。",
                 at_sender=True,
             )
             return
@@ -987,9 +987,9 @@ async def _handle_help(bot: NoneBot, ev: CQEvent, private: bool = False) -> None
         text += (
             "\n—— 私聊说明 ——\n"
             "以上命令私聊均可直接发送；\n"
-            "但 dfbind / lxbind / 水鱼授权码 / 落雪授权码\n"
-            "只能在群里发送——请先在任意群里完成授权，\n"
-            "之后私聊 mai上传 / 自动上传成绩 即可。"
+            "dfbind / lxbind / 水鱼授权码 / 落雪授权码 也支持私聊：\n"
+            "私聊发送后即可直接私聊 mai上传 / 自动上传成绩，\n"
+            "群里发送的授权同样通用（授权按 QQ 号记录，与在哪绑定无关）。"
         )
     await bot.send(ev, text, at_sender=True)
 
