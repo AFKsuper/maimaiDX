@@ -44,7 +44,7 @@ import time
 from typing import Optional
 
 import httpx
-from nonebot import NLPSession, NoneBot, get_bot, on_natural_language
+from nonebot import NLPSession, NoneBot, on_natural_language
 
 from hoshino.typing import CQEvent
 
@@ -811,15 +811,6 @@ def _auto_schedule(rec: dict, now: float, changed: bool, ok: bool) -> dict:
     return fields
 
 
-def _notify_target(ev: CQEvent) -> dict:
-    """记录结果回执发往哪里：私聊优先（需要 self_id），群里额外记群号做兜底。"""
-    group_id = getattr(ev, "group_id", None)
-    return {
-        "auto_upload_self": str(getattr(ev, "self_id", "") or ""),
-        "auto_upload_group": "" if group_id is None else str(group_id),
-    }
-
-
 def _auto_upload_status_text(rec: dict, on: bool) -> str:
     lines = [f"【自动上传成绩】{'✅ 已开启' if on else '▫ 已关闭'}"]
     if on:
@@ -831,18 +822,12 @@ def _auto_upload_status_text(rec: dict, on: bool) -> str:
             "cold": "cold（平时，1 小时探测一次）",
         }[tier]
         lines.append("模式：探测式自动更新（成绩有变化才上传）")
-        lines.append("来源：思路参考开源项目 maimai-score-hub 的 auto-update")
         lines.append(f"活跃分层：{tier_name}")
         lines.append(f"上次探测：{rec.get('auto_checked_at') or '尚未探测'}")
         lines.append(f"上次发现变化：{_fmt_ts(rec.get('auto_changed_at'))}")
         lines.append(f"下次探测：{_fmt_ts(rec.get('auto_next_at'))}")
         if rec.get("auto_fail"):
             lines.append(f"⚠ 连续失败 {rec.get('auto_fail')} 次（已自动退避重试）")
-        group_id = rec.get("auto_upload_group") or ""
-        if group_id:
-            lines.append(f"结果通知：先私聊；私聊失败时在群 {group_id} 里 @ 你")
-        else:
-            lines.append("结果通知：私聊（私聊失败不再群里兜底）")
     elif rec.get("auto_upload_off_at"):
         lines.append(f"关闭于：{rec.get('auto_upload_off_at')}")
     return "\n".join(lines)
@@ -881,7 +866,7 @@ async def _handle_auto_upload(bot: NoneBot, ev: CQEvent, arg: str = "") -> None:
             )
             return
         rec = set(qq, auto_upload=True, auto_upload_at=now_str(),
-                  auto_next_at=str(int(time.time())), **_notify_target(ev))
+                  auto_next_at=str(int(time.time())))
         await bot.send(
             ev, "✅ 已开启自动上传成绩\n" + _auto_upload_status_text(rec, True), at_sender=True
         )
@@ -897,18 +882,6 @@ async def auto_upload_cmd(bot: NoneBot, ev: CQEvent):
     await _handle_auto_upload(bot, ev)
 
 
-def _auto_platform_line(name: str, key: str, results: dict) -> str:
-    """自动上传结果里的一行平台状态（skipped 平台单独标注，不显示成失败）。"""
-    r = (results or {}).get(key)
-    if not isinstance(r, dict):
-        return f"❌ {name}：平台无返回结果"
-    if r.get("skipped"):
-        return f"▫ {name}：{r.get('msg') or '未提供凭据'}，已跳过"
-    if r.get("ok"):
-        return f"✅ {name}：{r.get('msg') or '上传成功'}"
-    return f"❌ {name}：{r.get('msg') or '未知错误'}"
-
-
 def _auto_report_ok(results: dict) -> bool:
     """有平台真的参与了上传、且参与的全都成功，才算这次成功。"""
     if not isinstance(results, dict) or "error" in results:
@@ -917,13 +890,23 @@ def _auto_report_ok(results: dict) -> bool:
     return bool(active) and all(v.get("ok") for v in active)
 
 
-async def _push_scores(qq, score_list, summary, title: str) -> tuple:
-    """把已拉取的成绩上传到水鱼 / 落雪，返回 (是否全部成功, 结果文本)。"""
+async def _auto_probe(qq, rec: dict) -> tuple:
+    """探测一次机台成绩：**有变化才上传**（静默执行，不发送结果通知）。
+
+    设计来源：maimai-score-hub 的 auto-update（详见模块头注释）。
+
+    返回 (changed, ok)；没有变化时 ok=True、changed=False。
+    """
     proxy = _proxy()
     df_on = bool(dfconfig.oauth_enabled)
     lx_token, _ = await _lxns_valid_token(qq)
     if not df_on and not lx_token:
-        return False, "⚠ 未完成任何上传平台授权（水鱼 / 落雪），本次跳过"
+        return False, False  # 没授权没目标：按失败走退避，不做无谓拉取
+
+    score_list, summary = await fetch_scores(rec.get("arcade_creds"), proxy)
+    digest = _scores_hash(score_list)
+    if rec.get("auto_hash") == digest:
+        return False, True
 
     results = await upload_scores(
         score_list,
@@ -931,79 +914,13 @@ async def _push_scores(qq, score_list, summary, title: str) -> tuple:
         lxns_access_token=lx_token,
         http_proxy=proxy,
     )
-    if isinstance(results, dict) and "error" in results:
-        return False, f"⚠ 未上传：{results.get('error')}"
-
-    lines = [title]
-    if isinstance(summary, dict):
-        if summary.get("score_count") is not None:
-            lines.append(f"共 {summary.get('score_count')} 条成绩")
-        if summary.get("rating") is not None:
-            lines.append(
-                f"Rating {summary.get('rating')}"
-                f"（B35 {summary.get('rating_b35', '-')} / "
-                f"B15 {summary.get('rating_b15', '-')}）"
-            )
-    lines.append("—— 上传结果 ——")
-    lines.append(_auto_platform_line("水鱼", "divingfish", results))
-    lines.append(_auto_platform_line("落雪", "lxns", results))
-    lines.append("（不想再自动上传：发送「自动上传成绩」关闭）")
-    return _auto_report_ok(results), "\n".join(lines)
-
-
-async def _auto_probe(qq, rec: dict) -> tuple:
-    """探测一次机台成绩：**有变化才上传**。
-
-    返回 (changed, ok, text)；没有变化时 text 为空串，调用方无需发消息。
-    """
-    proxy = _proxy()
-    df_on = bool(dfconfig.oauth_enabled)
-    lx_token, _ = await _lxns_valid_token(qq)
-    if not df_on and not lx_token:
-        return False, False, "⚠ 未完成任何上传平台授权（水鱼 / 落雪），本次跳过"
-
-    score_list, summary = await fetch_scores(rec.get("arcade_creds"), proxy)
-    digest = _scores_hash(score_list)
-    if rec.get("auto_hash") == digest:
-        return False, True, ""
-
-    ok, text = await _push_scores(qq, score_list, summary, "🔔 探测到成绩变化，已自动上传")
+    ok = _auto_report_ok(results)
     if ok:
         try:
             set(qq, auto_hash=digest)
         except Exception as e:  # noqa: BLE001
             log.warning(f"[mai_upload] 成绩指纹落盘失败 qq={qq}：{e}")
-    return True, ok, text
-
-
-async def _notify_auto_upload(qq, rec: dict, text: str) -> None:
-    """结果先私聊；私聊失败且用户是在群里开启的，就在群里 @ 他兜底。"""
-    try:
-        bot = get_bot()
-    except Exception as e:  # noqa: BLE001
-        log.warning(f"[mai_upload] 自动上传结果通知失败（无可用 bot）：{e}")
-        return
-    self_id = str(rec.get("auto_upload_self") or "")
-    group_id = str(rec.get("auto_upload_group") or "")
-
-    private_kwargs = {"user_id": int(qq), "message": text}
-    if self_id:
-        private_kwargs["self_id"] = int(self_id)
-    try:
-        await bot.send_private_msg(**private_kwargs)
-        return
-    except Exception as e:  # noqa: BLE001
-        log.warning(f"[mai_upload] 自动上传结果私聊发送失败 qq={qq}：{e}")
-
-    if not group_id:
-        return
-    group_kwargs = {"group_id": int(group_id), "message": f"[CQ:at,qq={qq}]\n{text}"}
-    if self_id:
-        group_kwargs["self_id"] = int(self_id)
-    try:
-        await bot.send_group_msg(**group_kwargs)
-    except Exception as e:  # noqa: BLE001
-        log.warning(f"[mai_upload] 自动上传结果群内兜底失败 qq={qq}：{e}")
+    return True, ok
 
 
 def _auto_targets() -> list:
@@ -1048,21 +965,15 @@ async def auto_update_tick():
             log.info(f"[mai_upload] 自动更新跳过 qq={qq}（该用户有操作正在进行）")
             continue
         changed = ok = False
-        text = ""
         try:
-            changed, ok, text = await _auto_probe(qq, rec)
+            changed, ok = await _auto_probe(qq, rec)
         except Exception as e:  # noqa: BLE001
-            ok, text = False, f"❌ 自动更新失败：{_friendly_error(e)}"
+            ok = False
             log.warning(f"[mai_upload] 自动更新探测异常 qq={qq}：{e}")
         finally:
             _release(qq)
         await _auto_save_schedule(qq, rec, changed, ok)
         log.info(f"[mai_upload] 自动更新探测完成 qq={qq} changed={changed} ok={ok}")
-        if text:
-            try:
-                await _notify_auto_upload(qq, rec, text)
-            except Exception as e:  # noqa: BLE001
-                log.warning(f"[mai_upload] 自动更新结果发送异常 qq={qq}：{e}")
         await asyncio.sleep(1)
 
 

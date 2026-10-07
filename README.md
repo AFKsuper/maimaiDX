@@ -148,7 +148,7 @@
 > 水鱼写入需要 `DIVINGFISH_SCOPE` 包含 `prober.records.write`，该写入权限需要水鱼应用过审；修改 scope 后必须重新发送 `dfbind` 重授权。未过审或 scope 不足时 `mai上传` 会回报水鱼侧错误。
 
 > [!NOTE]
-> **自动上传（探测式）**：设计参考 [bakapiano/maimai-score-hub](https://github.com/bakapiano/maimai-score-hub) 的 `auto-update` 模块（Rival-first：先探测、有变化才写入）。它的主探测用 `GetUserRivalMusicApi`，而 maimai-ffi 未暴露该接口（且其 rivalId 解析属闭源 sdgb 部分），因此本插件改用**完整成绩指纹**做探测。行为：开启后按活跃度分层探测机台成绩——刚发现变化后 15 分钟一次、12 小时内 30 分钟一次、之后 1 小时一次；**只有成绩指纹变化时才上传**（指纹只看 achievement / dxScore / FC / FS，不看游玩次数），没变化就不上传、也不发消息。因为指纹本身就包含 FC/FS，不需要额外的「每日兜底全量」。探测连续失败会自动退避（15→30→60→120 分钟）。结果优先私聊推送；若是在群里开启且私聊失败，会在该群 @ 你兜底。拉取/上传成绩如需代理，在 `.env` 设置 `MAI_HTTP_PROXY`。
+> **自动上传（探测式）**：设计参考 [bakapiano/maimai-score-hub](https://github.com/bakapiano/maimai-score-hub) 的 `auto-update` 模块（Rival-first：先探测、有变化才写入）。它的主探测用 `GetUserRivalMusicApi`，而 maimai-ffi 未暴露该接口（且其 rivalId 解析属闭源 sdgb 部分），因此本插件改用**完整成绩指纹**做探测。行为：开启后按活跃度分层探测机台成绩——刚发现变化后 15 分钟一次、12 小时内 30 分钟一次、之后 1 小时一次；**只有成绩指纹变化时才上传**（指纹只看 achievement / dxScore / FC / FS，不看游玩次数），没变化就不上传。因为指纹本身就包含 FC/FS，不需要额外的「每日兜底全量」。探测连续失败会自动退避（15→30→60→120 分钟）。上传**静默执行、不发送结果通知**（按用户要求移除），进度可随时用 `自动上传成绩 状态` 查询。拉取/上传成绩如需代理，在 `.env` 设置 `MAI_HTTP_PROXY`。
 
 > [!TIP]
 > **隐私**：
