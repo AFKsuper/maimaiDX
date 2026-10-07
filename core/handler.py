@@ -60,6 +60,8 @@ from .merge.models import (
 )
 from .merge.play_result import df_to_playresult, lxns_to_playresult
 from .merge.player import df_to_best50, df_to_player, lxns_to_best50
+from ..config import log
+from . import score_cache
 from .service import mai
 from .utils.calc import compute_rating
 
@@ -403,9 +405,44 @@ async def draw_best50(
     Returns:
         `MessageSegment`
     """
-    player, best50 = await get_best50(user, username=username, all_perfect=all_perfect)
-    b50 = PlayerBest50(user, player=player, best50=best50, is_username=bool(username))
-    return MessageSegment.image(await b50.draw()) + MessageSegment.text(MESSAGE)
+    try:
+        player, best50 = await get_best50(
+            user, username=username, all_perfect=all_perfect
+        )
+        if not username:
+            # 在线查询成功：顺手记一份昵称/Rating，供离线兜底出图时当标题
+            try:
+                score_cache.save_player(user.qqid, player)
+            except Exception as e:  # noqa: BLE001
+                log.warning(f"[handler] 记录玩家信息失败 qq={user.qqid}：{e}")
+        b50 = PlayerBest50(
+            user, player=player, best50=best50, is_username=bool(username)
+        )
+        return MessageSegment.image(await b50.draw()) + MessageSegment.text(MESSAGE)
+    except Exception as e:  # noqa: BLE001
+        # 在线查分器不可用：用本地缓存（机台上传时留下的全量成绩）兜底出图
+        if username:
+            raise  # 按用户名查的请求，本地缓存里没有对应数据
+        fallback = None
+        try:
+            fallback = score_cache.cached_best50(user.qqid)
+        except Exception as ce:  # noqa: BLE001
+            log.warning(f"[handler] 读取本地成绩缓存失败 qq={user.qqid}：{ce}")
+        if fallback is None:
+            raise
+        log.warning(
+            f"[handler] 在线查分失败，改用本地缓存出图 qq={user.qqid}："
+            f"{type(e).__name__}: {e}"
+        )
+        player, best50, notice = fallback
+        try:
+            b50 = PlayerBest50(user, player=player, best50=best50)
+            return MessageSegment.image(await b50.draw()) + MessageSegment.text(
+                notice + MESSAGE
+            )
+        except Exception as ce:  # noqa: BLE001
+            log.error(f"[handler] 本地缓存出图失败 qq={user.qqid}：{ce}")
+            raise e
 
 
 @handle_errors

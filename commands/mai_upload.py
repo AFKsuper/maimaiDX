@@ -59,6 +59,8 @@ try:
     from ..core.arcade_qr import decode_image, extract_from_text
     from ..core.arcade_store import all as store_all  # 全部绑定记录（自动上传遍历用）
     from ..core.arcade_store import get, mask, now_str, set  # noqa: A001 —— set 即 arcade_store.set
+    from ..core.score_cache import save_player as cache_save_player
+    from ..core.score_cache import save_scores as cache_save_scores
     from ..core.uploader import (
         MsuError,
         MsuInputError,
@@ -76,6 +78,7 @@ except Exception as e:  # noqa: BLE001
     get = set = mask = now_str = None  # type: ignore[assignment]
     store_all = None  # type: ignore[assignment]  # core 缺失时任务提前返回，不会调用
     bind_arcade = fetch_scores = upload_scores = None  # type: ignore[assignment]
+    cache_save_scores = cache_save_player = None  # type: ignore[assignment]
 
     class MsuError(Exception):
         pass
@@ -665,6 +668,12 @@ async def _handle_upload(bot: NoneBot, ev: CQEvent) -> None:
             await bot.send(ev, f"❌ 拉取成绩失败：{_friendly_error(e)}", at_sender=True)
             return
 
+        # 全量成绩落本地缓存（在线查分失败时用它兜底画 B50）；失败不影响主流程
+        try:
+            cache_save_scores(qq, score_list, summary)
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"[mai_upload] 成绩缓存写入失败 qq={qq}：{e}")
+
         try:
             results = await upload_scores(
                 score_list,
@@ -905,6 +914,13 @@ async def _auto_probe(qq, rec: dict) -> tuple:
 
     score_list, summary = await fetch_scores(rec.get("arcade_creds"), proxy)
     digest = _scores_hash(score_list)
+
+    # 每次探测成功都刷新本地缓存（即使成绩没变化，也能刷新缓存时间戳）
+    try:
+        cache_save_scores(qq, score_list, summary)
+    except Exception as e:  # noqa: BLE001
+        log.warning(f"[mai_upload] 探测成绩缓存写入失败 qq={qq}：{e}")
+
     if rec.get("auto_hash") == digest:
         return False, True
 
