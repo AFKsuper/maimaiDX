@@ -353,7 +353,8 @@ async def upload_scores(score_list: List[Any],
                         lxns_secret: Optional[str] = None,
                         divingfish_token: Optional[str] = None,
                         http_proxy: Optional[str] = None,
-                        timeout: float = 120) -> Dict[str, Any]:
+                        timeout: float = 120,
+                        disable_divingfish: bool = False) -> Dict[str, Any]:
     """
     把成绩并行上传到两平台（asyncio.gather，平台间互不影响）。
 
@@ -364,6 +365,10 @@ async def upload_scores(score_list: List[Any],
     - 落雪：lxns_access_token（JWT，走 user API + Bearer）优先；回退 lxns_secret
       （API-Secret，走 X-User-Token）；都无 → 该平台记 skipped。
     - 单平台异常互不影响；msg 经 friendly_message 翻译成中文。
+
+    disable_divingfish：调用方已经确认「水鱼这个 QQ 写不了」（未授权 / 授权范围不含
+    prober.records.write）时置 True，直接把水鱼记成 skipped，不再白发一次注定失败的
+    请求，也让 report_ok 的「参与平台」不含水鱼。
 
     http_proxy：上传链路的 DivingFish/LXNS provider 构造签名无 http_proxy 参数
     （见模块 docstring），此参数仅透传给 Arcade 链路调用方使用，上传本身不受影响。
@@ -381,7 +386,10 @@ async def upload_scores(score_list: List[Any],
     report: Dict[str, Any] = {}
 
     # 水鱼凭据：手动 Import-Token > OAuth（ref: subject）
-    if divingfish_token:
+    if disable_divingfish and not divingfish_token:
+        report["divingfish"] = {"ok": False, "skipped": True,
+                                "msg": "水鱼上传权限不可用，已跳过"}
+    elif divingfish_token:
         jobs.append(("divingfish", _upload_one(
             _df_provider(),
             PlayerIdentifier(credentials=divingfish_token),  # 个人 API：Import-Token 走 credentials

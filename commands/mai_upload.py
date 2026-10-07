@@ -143,6 +143,8 @@ SV_HELP = """【maimaiDX 舞萌成绩上传】
 5. 自动上传成绩 —— 开关探测式自动更新（重发即切换）
    成绩有变化才上传（刚变化 15 分钟 / 近期 30 分钟 / 平时 60 分钟探测一次）
    自动上传成绩 开 / 关 / 状态
+   开启前会先检查水鱼是否具备「上传成绩」权限：若该 QQ 未授权（或授权范围
+   不含写入），会提示先发 dfbind 绑定水鱼；只用落雪则可发 lxbind 后开启。
 mai帮助 查看本帮助"""
 
 # ============================================================
@@ -393,6 +395,87 @@ async def _lxns_token_state(qq) -> Optional[str]:
 
 
 # ============================================================
+# 水鱼「传分（写入）」权限检查
+# ============================================================
+
+# 换票成功结果的短期缓存 {qq: (过期时间戳, True)}；失败一律不缓存
+_DF_WRITE_CACHE_SECONDS = 300
+_df_write_cache: dict = {}
+
+
+async def _df_write_state(qq) -> tuple:
+    """检查该 QQ 在水鱼是否真的具备「上传成绩（写入）」权限。
+
+    三道门槛缺一不可，逐层给出可直接展示给用户的原因：
+
+    1. `.env` 配了 `DIVINGFISH_CLIENT_ID / CLIENT_SECRET`（应用本身可用）；
+    2. 应用申请的 scope 含 `prober.records.write`（应用过审、拿到了写入权限）；
+    3. 该 QQ 完成过水鱼授权，且**实际授予**的范围含写入（用户同意 ∩ 应用获批）。
+
+    第 3 道用一次 on-behalf-of 换票来验：换票抛 `consent_required`（被翻译成
+    `DivingFishNotAuthorizedError`）说明这个 QQ 根本没授权；换票成功但返回的
+    `scope` 里没有写入项，说明授权时没同意写入、或应用是之后才补的 scope——
+    这两种情况都必须在重新 `dfbind` 之后才会好。
+
+    返回 `(ok, reason)`：`ok=True` 时 reason 为空串；否则 reason 是中文原因。
+    """
+    # 换票是一次真实网络请求，成功结果短期缓存，避免状态查询反复打水鱼。
+    # **只缓存成功**：失败不缓存，用户刚发完 dfbind 就能立刻重试生效。
+    cached = _df_write_cache.get(str(qq))
+    if cached and cached[0] > time.time():
+        return True, ""
+
+    if not dfconfig.oauth_enabled:
+        return False, (
+            "水鱼应用未配置（.env 需 DIVINGFISH_CLIENT_ID / DIVINGFISH_CLIENT_SECRET）"
+        )
+    try:
+        app_has_write = bool(
+            dfconfig.divingfish_scope & DivingFishScope.PROBER_RECORDS_WRITE
+        )
+    except Exception:  # noqa: BLE001
+        app_has_write = False
+    if not app_has_write:
+        return False, (
+            "水鱼应用未申请写入权限（.env 的 DIVINGFISH_SCOPE 缺 prober.records.write）"
+        )
+
+    # 惰性导入：这两个模块万一缺失，也不该让整个 mai_upload 的 core 导入失败
+    try:
+        from ..core.clients.divingfish.exceptions import DivingFishNotAuthorizedError
+        from ..core.clients.divingfish.oauth import DivingFishOAuth
+    except Exception as e:  # noqa: BLE001
+        return False, f"水鱼 OAuth 模块不可用（{type(e).__name__}）"
+
+    try:
+        token = await DivingFishOAuth().fetch_token(qq)
+    except DivingFishNotAuthorizedError:
+        return False, "该 QQ 尚未完成水鱼授权"
+    except Exception as e:  # noqa: BLE001
+        return False, f"水鱼授权校验未通过（{_friendly_error(e)}）"
+
+    granted = str(getattr(token, "scope", "") or "").split()
+    if granted and "prober.records.write" not in granted:
+        return False, "水鱼授权范围不含写入（授权时未同意，或应用之后才补的权限）"
+    _df_write_cache[str(qq)] = (time.time() + _DF_WRITE_CACHE_SECONDS, True)
+    return True, ""
+
+
+def _df_write_guide(reason: str) -> str:
+    """开启自动上传被「水鱼写入权限」拦下时的提示文案。"""
+    return (
+        "⚠ 未检测到水鱼「上传成绩」权限，已取消开启自动上传。\n"
+        f"原因：{reason}\n"
+        "请先绑定水鱼获取权限：发送 dfbind（或 水鱼授权码），"
+        "打开链接确认授权后，把页面上的确认码发回给机器人；"
+        "完成后再发一次「自动上传成绩 开」。\n"
+        "（水鱼写入权限要求插件应用已过审且 scope 含 prober.records.write；"
+        "改过 .env 的 DIVINGFISH_SCOPE 后必须重新发一次 dfbind 才会生效。）\n"
+        "若你只用落雪，也可以发送 lxbind（或 落雪授权码）绑定落雪后再开启。"
+    )
+
+
+# ============================================================
 # 命令一：绑定（二维码 → 机台凭据）
 # ============================================================
 
@@ -556,7 +639,7 @@ async def _handle_status(bot: NoneBot, ev: CQEvent) -> None:
     else:
         lines.append("· 机台账号：未绑定（mai绑定 + 二维码）")
 
-    # 水鱼授权状态：应用配置齐不齐 + 写 scope
+    # 水鱼授权状态：应用配置齐不齐 + 写 scope + 该 QQ 实际授予范围（换票实测）
     if dfconfig.oauth_enabled:
         has_write = bool(
             dfconfig.divingfish_scope & DivingFishScope.PROBER_RECORDS_WRITE
@@ -568,6 +651,11 @@ async def _handle_status(bot: NoneBot, ev: CQEvent) -> None:
                 "· 水鱼 OAuth：应用已配置，但 ⚠ DIVINGFISH_SCOPE 缺 prober.records.write"
                 "（上传需补 scope、应用过审后重新授权）"
             )
+        df_write, df_reason = await _df_write_state(qq)
+        if df_write:
+            lines.append("· 水鱼上传权限：✅ 已获得（该 QQ 授权范围含写入）")
+        else:
+            lines.append(f"· 水鱼上传权限：⚠ 不可用（{df_reason}）")
     else:
         lines.append("· 水鱼 OAuth：未配置（.env 需 DIVINGFISH_CLIENT_ID / DIVINGFISH_CLIENT_SECRET）")
 
@@ -628,10 +716,10 @@ async def _handle_upload(bot: NoneBot, ev: CQEvent) -> None:
             )
             return
 
-        # ---- 判定各平台可用性：水鱼=OAuth 应用配置；落雪=QQ 库 token ----
+        # ---- 判定各平台可用性：水鱼=授权且实际含写入；落雪=QQ 库 token ----
         proxy = _proxy()
-        df_on = bool(dfconfig.oauth_enabled)
-        df_skip = "" if df_on else "未配置 DIVINGFISH_CLIENT_ID/SECRET（.env）"
+        df_on, df_reason = await _df_write_state(qq)
+        df_skip = "" if df_on else f"水鱼上传权限不可用（{df_reason}）"
 
         lx_token, lx_err = await _lxns_valid_token(qq)
         lx_on = bool(lx_token)
@@ -646,7 +734,8 @@ async def _handle_upload(bot: NoneBot, ev: CQEvent) -> None:
             await bot.send(
                 ev,
                 "⚠ 还未完成任何平台的上传授权，没有可上传的目标平台。\n"
-                "· 水鱼：发送 dfbind（或 水鱼授权码）；需 .env 配置 DIVINGFISH_CLIENT_ID/SECRET\n"
+                f"· 水鱼：{df_reason}\n"
+                "  发送 dfbind（或 水鱼授权码），把授权页给的确认码发回给机器人即可\n"
                 "· 落雪：发送 lxbind（或 落雪授权码）；需 .env 配置 LX_CLIENT_ID/SECRET\n"
                 "（群聊或私聊发送均可）授权后重发 mai上传。",
                 at_sender=True,
@@ -680,6 +769,7 @@ async def _handle_upload(bot: NoneBot, ev: CQEvent) -> None:
                 qq,
                 lxns_access_token=lx_token,
                 http_proxy=proxy,
+                disable_divingfish=not df_on,
             )
         except Exception as e:  # noqa: BLE001
             await _drop_progress()
@@ -747,7 +837,9 @@ def _auto_upload_usage() -> str:
         "· 自动上传成绩 开（或 关）\n"
         "· 自动上传成绩 状态\n"
         "开启后机器人会定期探测机台成绩，**发现成绩有变化才上传**"
-        "（刚有变化 15 分钟一次 / 近期 30 分钟 / 平时 1 小时）。"
+        "（刚有变化 15 分钟一次 / 近期 30 分钟 / 平时 1 小时）。\n"
+        "开启前会先检查水鱼「上传成绩」权限：未授权会提示先发 dfbind 绑定水鱼；"
+        "只用落雪可发 lxbind 后开启。"
     )
 
 
@@ -874,10 +966,27 @@ async def _handle_auto_upload(bot: NoneBot, ev: CQEvent, arg: str = "") -> None:
                 at_sender=True,
             )
             return
+
+        # ---- 开启前先确认「真有可写入的上传目标」，否则开了也是白探测 ----
+        # 水鱼：必须应用已配 + scope 含写入 + 该 QQ 授权且实际授予写入（换票实测）
+        df_write, df_reason = await _df_write_state(qq)
+        lx_token, _lx_err = await _lxns_valid_token(qq)
+        if not df_write and not lx_token:
+            await bot.send(ev, _df_write_guide(df_reason), at_sender=True)
+            return
+
         rec = set(qq, auto_upload=True, auto_upload_at=now_str(),
                   auto_next_at=str(int(time.time())))
+        extra = ""
+        if not df_write:
+            extra = (
+                f"\n· 水鱼不可用（{df_reason}），本次仅上传到落雪。\n"
+                "  需要水鱼也同步的话，请发送 dfbind 完成水鱼授权后重新开启。"
+            )
         await bot.send(
-            ev, "✅ 已开启自动上传成绩\n" + _auto_upload_status_text(rec, True), at_sender=True
+            ev,
+            "✅ 已开启自动上传成绩\n" + _auto_upload_status_text(rec, True) + extra,
+            at_sender=True,
         )
     else:
         rec = set(qq, auto_upload=False, auto_upload_off_at=now_str())
@@ -907,9 +1016,10 @@ async def _auto_probe(qq, rec: dict) -> tuple:
     返回 (changed, ok)；没有变化时 ok=True、changed=False。
     """
     proxy = _proxy()
-    df_on = bool(dfconfig.oauth_enabled)
+    # 水鱼必须「真的能写」才算上传目标（只配了应用但用户没授权/没写入 scope 时不算）
+    df_write, _df_reason = await _df_write_state(qq)
     lx_token, _ = await _lxns_valid_token(qq)
-    if not df_on and not lx_token:
+    if not df_write and not lx_token:
         return False, False  # 没授权没目标：按失败走退避，不做无谓拉取
 
     score_list, summary = await fetch_scores(rec.get("arcade_creds"), proxy)
@@ -929,6 +1039,7 @@ async def _auto_probe(qq, rec: dict) -> tuple:
         qq,
         lxns_access_token=lx_token,
         http_proxy=proxy,
+        disable_divingfish=not df_write,
     )
     ok = _auto_report_ok(results)
     if ok:
