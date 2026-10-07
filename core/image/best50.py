@@ -14,6 +14,18 @@ from .base import ScoreBaseImage
 from .tools import image_to_base64
 
 
+def _usable_asset(asset) -> bool:
+    """素材是否可用：BytesIO 视为可用，Path 需真实存在，None 不可用。"""
+    if asset is None:
+        return False
+    if isinstance(asset, (BytesIO, bytes)):
+        return True
+    try:
+        return Path(asset).exists()
+    except TypeError:
+        return False
+
+
 class PlayerBest50(ScoreBaseImage):
     def __init__(
         self,
@@ -126,14 +138,23 @@ class PlayerBest50(ScoreBaseImage):
             plate_path = await self._fetch_image("plate", self.player.name_plate.id)
         else:
             plate_path = plate_version_dir / f"{self.player.name_plate}.png"
+        if not _usable_asset(plate_path):
+            # 在线素材拿不到（断网/资源站异常）时退回本地默认铭牌，别让整张图渲染失败
+            plate_path = pic_dir / "UI_Plate_550101.png"
         self._im.alpha_composite(Image.open(plate_path).resize((800, 130)), (300, 60))
 
         # icon
         if self.player.icon:
             icon = await self._fetch_image("icon", self.player.icon.id)
         elif self.qqid:
-            icon = BytesIO(await qqlogo(self.qqid))
+            try:
+                icon = BytesIO(await qqlogo(self.qqid))
+            except Exception:
+                # QQ 头像接口不可用（断网等）时退回本地默认头像
+                icon = pic_dir / "UI_Icon_509506.png"
         else:
+            icon = pic_dir / "UI_Icon_509506.png"
+        if not _usable_asset(icon):
             icon = pic_dir / "UI_Icon_509506.png"
         self._im.alpha_composite(
             Image.open(icon).convert("RGBA").resize((120, 120)), (305, 65)
