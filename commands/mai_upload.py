@@ -23,7 +23,7 @@ https://github.com/bakapiano/maimai-score-hub/tree/main/docs/specs/auto-update
 
 隐私：
 - 检测到 SGWCMAID 内容（文本或二维码图片）时，机器人在群里若是管理员会先替用户
-  撤回该消息；撤回失败或不是管理员，才在回复里提示用户自己撤回。
+  撤回该消息，并在回复里说明（撤回成功提示已撤回，撤回失败则请用户自己撤回）。
 - 群里裸发的普通图片（不是舞萌二维码）静默跳过，不打扰群聊；
   私聊裸发图片则会提示「二维码内容识别失败」。
 - mai上传 的「⏳ 正在拉取成绩并上传…」在结果返回后自动撤回，避免刷屏。
@@ -229,11 +229,22 @@ async def _recall_msg(bot: NoneBot, ev: CQEvent, message_id) -> bool:
         return False
 
 
+def _recalled_hint(what: str = "二维码") -> str:
+    """机器人已代为撤回时的提示：告知群友该消息已处理，并提醒别再群发。"""
+    return (
+        f"\n\n🔒 含隐私的{what}消息已由机器人撤回；"
+        "为保护账号隐私，请勿在群里发送机台二维码"
+    )
+
+
 async def _privacy_tail(bot: NoneBot, ev: CQEvent, what: str = "二维码") -> str:
-    """检测到含 SGWCMAID 的内容后：机器人在群里是管理员就先替用户撤回，
-    撤回失败（或不是管理员）再提示用户自己撤回；私聊撤不了对方消息，直接提示。"""
+    """检测到含 SGWCMAID 的内容后：机器人在群里是管理员就先替用户撤回。
+
+    无论撤回成功与否，回复里都附上提示（群聊里其他人也能看到这句话，
+    避免只有机器人静默撤回、群友无从得知）：撤回成功告知已撤回，
+    撤回失败（或不是管理员）则请用户自己撤回；私聊撤不了对方消息，同样只提示。"""
     if ev.detail_type == "group" and await _recall_msg(bot, ev, ev.message_id):
-        return ""
+        return _recalled_hint(what)
     return _recall_hint(what)
 
 
@@ -561,7 +572,7 @@ async def _handle_bind(bot: NoneBot, ev: CQEvent, bare: bool = False) -> None:
             return
 
         # 已确认是舞萌机台二维码 —— 立刻处理隐私：机器人是群管理员就先替用户撤回，
-        # 撤不掉再在回复里提示（不等 bind_arcade 联网，越早撤回越安全）
+        # 同时回复里附上撤回提醒（不等 bind_arcade 联网，越早撤回越安全）
         privacy_tail = await _privacy_tail(bot, ev)
 
         # 调 core 完成绑定并落库
