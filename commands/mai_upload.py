@@ -1114,17 +1114,8 @@ async def auto_update_tick():
 # 帮助
 # ============================================================
 
-async def _handle_help(bot: NoneBot, ev: CQEvent, private: bool = False) -> None:
-    text = SV_HELP
-    if private:
-        text += (
-            "\n—— 私聊说明 ——\n"
-            "以上命令私聊均可直接发送；\n"
-            "dfbind / lxbind / 水鱼授权码 / 落雪授权码 也支持私聊：\n"
-            "私聊发送后即可直接私聊 mai上传 / 自动上传成绩，\n"
-            "群里发送的授权同样通用（授权按 QQ 号记录，与在哪绑定无关）。"
-        )
-    await bot.send(ev, text, at_sender=True)
+async def _handle_help(bot: NoneBot, ev: CQEvent) -> None:
+    await bot.send(ev, SV_HELP, at_sender=True)
 
 
 @help_cmd
@@ -1177,7 +1168,7 @@ async def _private_dispatch(session: NLPSession) -> None:
     elif text.startswith("mai上传"):
         await _handle_upload(bot, ev)
     elif text.startswith("mai帮助"):
-        await _handle_help(bot, ev, private=True)
+        await _handle_help(bot, ev)
     # 其它只是碰巧含关键词的消息（如英文句子带 mai）：什么都不做，直接放行
 
 
