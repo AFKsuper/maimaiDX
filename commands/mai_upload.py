@@ -629,6 +629,34 @@ async def bare_image_qr(bot: NoneBot, ev: CQEvent) -> None:
 # 命令二：绑定状态
 # ============================================================
 
+async def _df_status_line(qq) -> str:
+    """面向普通用户的一行水鱼状态。
+
+    刻意不暴露 `.env` / scope / OAuth 等管理员术语：应用层面的问题统一折叠为
+    「暂不可用」，只区分用户自己能解决的部分（未绑定 → 引导 dfbind）。
+    """
+    if not dfconfig.oauth_enabled or not (
+        dfconfig.divingfish_scope & DivingFishScope.PROBER_RECORDS_WRITE
+    ):
+        return "· 水鱼上传查分权限：⚠ 暂不可用 —— 请联系机器人管理员"
+    df_write, _reason = await _df_write_state(qq)
+    if df_write:
+        return "· 水鱼上传查分权限：✅ 已绑定"
+    return "· 水鱼上传查分权限：❌ 未绑定 —— 发送 dfbind 绑定水鱼"
+
+
+async def _lx_status_line(qq) -> str:
+    """面向普通用户的一行落雪状态。token 过期但可续期仍算「已绑定」。"""
+    lx_state = await _lxns_token_state(qq)
+    if lx_state is None:
+        if lxnsconfig.lx_client_id and lxnsconfig.lx_client_secret:
+            return "· 落雪上传查分权限：❌ 未绑定 —— 发送 lxbind 绑定落雪"
+        return "· 落雪上传查分权限：⚠ 暂不可用 —— 请联系机器人管理员"
+    if "缺少 refresh_token" in lx_state:
+        return "· 落雪上传查分权限：❌ 已过期 —— 请重新发送 lxbind 绑定落雪"
+    return "· 落雪上传查分权限：✅ 已绑定"
+
+
 async def _handle_status(bot: NoneBot, ev: CQEvent) -> None:
     if not _core_ok:
         await bot.send(ev, _setup_hint("core.arcade_store 模块"), at_sender=True)
@@ -638,43 +666,14 @@ async def _handle_status(bot: NoneBot, ev: CQEvent) -> None:
     lines = ["【maimaiDX 成绩上传 绑定状态】"]
 
     # 机台凭据
-    arcade = rec.get("arcade_creds")
-    if arcade:
-        bound_at = rec.get("bound_at") or "未知时间"
-        lines.append(f"· 机台账号：已绑定（凭据 {mask(arcade)}，{bound_at}）")
+    if rec.get("arcade_creds"):
+        lines.append("· 机台账号：✅ 已绑定")
     else:
-        lines.append("· 机台账号：未绑定（mai绑定 + 二维码）")
+        lines.append("· 机台账号：❌ 未绑定 —— 发送「mai绑定」并附上机台二维码")
 
-    # 水鱼授权状态：应用配置齐不齐 + 写 scope + 该 QQ 实际授予范围（换票实测）
-    if dfconfig.oauth_enabled:
-        has_write = bool(
-            dfconfig.divingfish_scope & DivingFishScope.PROBER_RECORDS_WRITE
-        )
-        if has_write:
-            lines.append("· 水鱼 OAuth：应用已配置（scope 含写入；用户授权发 dfbind / 水鱼授权码）")
-        else:
-            lines.append(
-                "· 水鱼 OAuth：应用已配置，但 ⚠ DIVINGFISH_SCOPE 缺 prober.records.write"
-                "（上传需补 scope、应用过审后重新授权）"
-            )
-        df_write, df_reason = await _df_write_state(qq)
-        if df_write:
-            lines.append("· 水鱼上传权限：✅ 已获得（该 QQ 授权范围含写入）")
-        else:
-            lines.append(f"· 水鱼上传权限：⚠ 不可用（{df_reason}）")
-    else:
-        lines.append("· 水鱼 OAuth：未配置（.env 需 DIVINGFISH_CLIENT_ID / DIVINGFISH_CLIENT_SECRET）")
-
-    # 落雪授权状态：应用配置 + QQ 库 token 有无
-    lx_state = await _lxns_token_state(qq)
-    lx_cfg_ok = bool(lxnsconfig.lx_client_id and lxnsconfig.lx_client_secret)
-    if lx_state is None:
-        if lx_cfg_ok:
-            lines.append("· 落雪 OAuth：应用已配置，用户未绑定（发 lxbind / 落雪授权码）")
-        else:
-            lines.append("· 落雪 OAuth：未配置（.env 需 LX_CLIENT_ID / LX_CLIENT_SECRET；用户未绑定）")
-    else:
-        lines.append(f"· 落雪 OAuth：{lx_state}")
+    # 水鱼 / 落雪（均由各自辅助函数折叠为面向用户的一行）
+    lines.append(await _df_status_line(qq))
+    lines.append(await _lx_status_line(qq))
 
     # 手动备用凭据已按用户要求移除（不再支持 Import-Token / API-Secret）
     await bot.send(ev, "\n".join(lines), at_sender=True)
