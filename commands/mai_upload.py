@@ -58,7 +58,7 @@ _core_error = None
 try:
     from ..core.arcade_qr import decode_image, extract_from_text
     from ..core.arcade_store import all as store_all  # 全部绑定记录（自动上传遍历用）
-    from ..core.arcade_store import get, mask, now_str, set  # noqa: A001 —— set 即 arcade_store.set
+    from ..core.arcade_store import get, now_str, set  # noqa: A001 —— set 即 arcade_store.set
     from ..core.score_cache import save_player as cache_save_player
     from ..core.score_cache import save_scores as cache_save_scores
     from ..core.uploader import (
@@ -75,7 +75,7 @@ except Exception as e:  # noqa: BLE001
     _core_error = e
     extract_from_text = None
     decode_image = None
-    get = set = mask = now_str = None  # type: ignore[assignment]
+    get = set = now_str = None  # type: ignore[assignment]
     store_all = None  # type: ignore[assignment]  # core 缺失时任务提前返回，不会调用
     bind_arcade = fetch_scores = upload_scores = None  # type: ignore[assignment]
     cache_save_scores = cache_save_player = None  # type: ignore[assignment]
@@ -590,7 +590,7 @@ async def _handle_bind(bot: NoneBot, ev: CQEvent, bare: bool = False) -> None:
             ev,
             "✅ 已绑定机台账号\n"
             "凭据已保存，后续上传无需再扫码\n"
-            f"凭据：{mask(creds)}" + privacy_tail,
+            "使用 ‘自动上传成绩’ 即可开启自动同步最新成绩" + privacy_tail,
             at_sender=True,
         )
     finally:
