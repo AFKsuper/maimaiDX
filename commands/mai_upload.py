@@ -1055,6 +1055,91 @@ async def _auto_probe(qq, rec: dict) -> tuple:
     return True, ok
 
 
+# ------------------------------------------------------------
+# 隧道探活告警：手机跳板掉线时主动私聊管理员
+# ------------------------------------------------------------
+# 背景：2026-10-18 那次掉线持续了 16 小时都没人发现。原因是手机上的守护
+# 脚本 keeper 与 gost 同装在一个 Termux 里 —— Termux 被系统整体杀掉时，
+# gost 和 keeper 一起消失，手机上没有任何活着的进程能自愈或报信。
+# 所以补一道【服务器侧】的独立探活：只要配了 MAI_HTTP_PROXY，每轮心跳先测
+# 一次代理能否出网，连续失败就私聊管理员；恢复后再报一条。
+TUNNEL_ALERT_MIN_FAILS = 3      # 连续失败几次才告警（心跳 5 分钟一次，约 15 分钟）
+TUNNEL_PROBE_TIMEOUT = 8.0      # 探活超时（秒）：要短，别拖慢心跳
+_tunnel_state = {"fails": 0, "alerted": False}
+
+
+async def _tunnel_probe(proxy: str) -> bool:
+    """测代理能不能出网。只判断「通 / 不通」，不关心返回内容。"""
+    try:
+        async with httpx.AsyncClient(
+            proxy=proxy, timeout=TUNNEL_PROBE_TIMEOUT, follow_redirects=True
+        ) as client:
+            await client.get("https://www.baidu.com")
+        return True
+    except Exception as e:  # noqa: BLE001
+        log.info(f"[mai_upload] 隧道探活失败：{type(e).__name__}: {e}")
+        return False
+
+
+async def _notify_superusers(text: str) -> None:
+    """私聊通知管理员。没配 SUPERUSERS、bot 未就绪、发送失败都只记日志。"""
+    try:
+        from hoshino.config import SUPERUSERS
+    except Exception:  # noqa: BLE001
+        log.warning("[mai_upload] 隧道告警未发送：读不到 hoshino.config.SUPERUSERS")
+        return
+    bot = None
+    try:
+        from nonebot import get_bot
+
+        bot = get_bot()
+    except Exception:  # noqa: BLE001
+        pass
+    if bot is None:
+        log.warning("[mai_upload] 隧道告警未发送：bot 尚未就绪")
+        return
+    for uid in SUPERUSERS or []:
+        try:
+            await bot.send_private_msg(user_id=int(uid), message=text)
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"[mai_upload] 隧道告警发送给 {uid} 失败：{e}")
+
+
+async def _tunnel_check_and_alert() -> None:
+    """每轮心跳先探一次隧道：连续失败告警一次，恢复后再报一次（不刷屏）。"""
+    proxy = _proxy()
+    if not proxy:
+        return  # 直连模式，没有隧道可探
+    st = _tunnel_state
+    try:
+        ok = await _tunnel_probe(proxy)
+    except Exception as e:  # noqa: BLE001
+        # 探活本身炸了（DNS、socket、超时之外的意外）当「不通」处理：
+        # 宁可多报一次，也不能让心跳因为探活异常而中断。
+        log.info(f"[mai_upload] 隧道探活异常，按不通处理：{type(e).__name__}: {e}")
+        ok = False
+    if ok:
+        if st["alerted"]:
+            st["alerted"] = False
+            log.info("[mai_upload] 隧道已恢复")
+            await _notify_superusers("✅ 手机跳板已恢复，成绩自动上传继续运行。")
+        st["fails"] = 0
+        return
+
+    st["fails"] += 1
+    log.warning(f"[mai_upload] 隧道探活连续失败 {st['fails']} 次")
+    if st["fails"] >= TUNNEL_ALERT_MIN_FAILS and not st["alerted"]:
+        st["alerted"] = True
+        minutes = st["fails"] * AUTO_TICK_MINUTES
+        await _notify_superusers(
+            "⚠ 手机跳板掉线，成绩自动上传已暂停\n"
+            f"已连续 {st['fails']} 次探活失败（约 {minutes} 分钟）。\n"
+            "处理：手机上打开 Termux 执行\n"
+            "bash ~/start-gost.sh\n"
+            "恢复后会自动继续上传，无需重启机器人。"
+        )
+
+
 def _auto_targets() -> list:
     """所有「已开启自动上传且有凭据」的用户 [(qq, rec), ...]（快照，避免边遍历边改）。"""
     return [
@@ -1086,6 +1171,12 @@ async def auto_update_tick():
     except Exception as e:  # noqa: BLE001
         log.error(f"[mai_upload] 读取绑定记录失败，自动更新心跳结束：{e}")
         return
+
+    # 先探隧道：掉线时上面的探测/上传必然全失败，早报比晚报有用
+    try:
+        await _tunnel_check_and_alert()
+    except Exception as e:  # noqa: BLE001
+        log.warning(f"[mai_upload] 隧道探活异常（不影响自动更新）：{e}")
 
     now = time.time()
     due = [(qq, rec) for qq, rec in records if _auto_due(rec, now)]
