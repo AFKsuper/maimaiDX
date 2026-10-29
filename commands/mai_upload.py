@@ -65,6 +65,7 @@ try:
         MsuError,
         MsuInputError,
         MsuTimeoutError,
+        aime_error_id,
         bind_arcade,
         fetch_scores,
         upload_scores,
@@ -79,6 +80,9 @@ except Exception as e:  # noqa: BLE001
     store_all = None  # type: ignore[assignment]  # core 缺失时任务提前返回，不会调用
     bind_arcade = fetch_scores = upload_scores = None  # type: ignore[assignment]
     cache_save_scores = cache_save_player = None  # type: ignore[assignment]
+
+    def aime_error_id(exc):  # noqa: ANN001, ANN202
+        return None
 
     class MsuError(Exception):
         pass
@@ -578,6 +582,15 @@ async def _handle_bind(bot: NoneBot, ev: CQEvent, bare: bool = False) -> None:
         try:
             creds = await bind_arcade(content, _proxy())
         except Exception as e:  # noqa: BLE001
+            # 绑定失败必须先落日志：插件日志是唯一能在事后判断
+            # 「是我们代码错 / 是华立服务端错」的证据，之前这里只 bot.send 不写日志，
+            # 导致 10-24 起的新用户绑定失败查无可查。
+            # 注意 log 是 loguru，只认 {} 占位或 f-string，%s 会原样输出。
+            log.error(
+                f"[mai_upload] 机台二维码兑换失败 qq={qq} "
+                f"type={type(e).__name__} errorID={aime_error_id(e)} "
+                f"qr_len={len(content or '')} msg={e}"
+            )
             await bot.send(
                 ev,
                 f"❌ 绑定失败：{_friendly_error(e)}" + privacy_tail,

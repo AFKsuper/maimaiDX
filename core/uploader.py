@@ -42,6 +42,7 @@ maimaiDX/core/uploader.py —— 机台绑定 / 成绩拉取 / 上传（自 maim
 import asyncio
 import hashlib
 import logging
+import re
 from typing import Any, Awaitable, Dict, List, Optional, Tuple, Type, TypeVar
 
 from ..config import dfconfig
@@ -146,7 +147,28 @@ _NET_ERRS += (ConnectionError, OSError)
 
 # ---------- 异常 → 用户可读中文提示（对上层唯一的翻译入口） ----------
 
-MSG_AIME = "二维码无效或已过期，请重新扫码"
+MSG_AIME = "二维码兑换失败：机台服务器返回未知错误，请稍后重试"
+# errorID 54（UnknownError）：华立 AimeDB 的 /wc_aime/api/get_data 对任何请求恒回 54
+# （2026-10-24 起实测：换 chipID / 签名顺序 / 字段 / 域名 / UA 均无效），
+# 与用户二维码新旧无关。旧文案「二维码无效或已过期」会让人反复重扫码，属于误导。
+MSG_AIME_54 = (
+    "二维码兑换失败：机台服务器暂时无法验证二维码"
+    "（华立 AimeDB 接口异常，errorID 54）。\n"
+    "这不是你的二维码过期，重新扫码也没用，只能等华立修复。\n"
+    "已绑定过的账号不受影响，自动上传照常运行。"
+)
+_AIME_ERROR_HINTS: Dict[int, str] = {54: MSG_AIME_54}
+_AIME_ID_RE = re.compile(r"errorID\s*[:：]?\s*(\d+)", re.IGNORECASE)
+
+
+def aime_error_id(exc: BaseException) -> Optional[int]:
+    """从 AimeServerError 的文本里抠 errorID（ffi 不提供结构化字段，只能正则）。"""
+    try:
+        m = _AIME_ID_RE.search(str(exc))
+    except Exception:  # noqa: BLE001 —— 异常对象异常时不影响上层提示
+        return None
+    return int(m.group(1)) if m else None
+
 MSG_BLOCKED = "机台服务器拒绝了请求(IP可能被封)，稍后再试或配置 http_proxy"
 MSG_NET_TITLE = "连接机台服务器失败，请稍后再试"
 MSG_PRIVACY = "落雪新用户需先用落雪官方代理上传一次并同意隐私设置，否则无法用 API 上传"
@@ -209,6 +231,16 @@ def friendly_message(exc: BaseException) -> str:
     # 水鱼 OAuth 未完成授权：文案按 .env 的 scope 配置分流，不走 _FAMILIES 静态映射
     if PlayerNotAuthorizedError is not None and isinstance(exc, PlayerNotAuthorizedError):
         return _oauth_error_message()
+    # AimeServerError 按 errorID 分流：54 是华立侧故障，不是「二维码过期」。
+    # 不依赖 _FAMILIES（那里是静态元组，缺依赖时为 None 会被过滤掉）。
+    if AimeServerError is not None and isinstance(exc, AimeServerError):
+        eid = aime_error_id(exc)
+        if eid is not None:
+            hint = _AIME_ERROR_HINTS.get(eid)
+            if hint:
+                return hint
+            return "%s（errorID %d）" % (MSG_AIME, eid)
+        return MSG_AIME
     for cls, msg in _FAMILIES:
         if isinstance(exc, cls):
             return msg
@@ -262,7 +294,7 @@ async def bind_arcade(qr_content: str, http_proxy: Optional[str] = None) -> str:
     """
     _require_maimai()
     if not qr_content or "SGWCMAID" not in qr_content.upper():
-        raise MsuInputError("二维码无效或已过期，请重新扫码（内容需以 SGWCMAID 开头）")
+        raise MsuInputError("二维码内容格式不正确：需以 SGWCMAID 开头，请重新扫码")
     identifier = await with_timeout(
         _get_client().qrcode(qr_content.strip(), http_proxy=http_proxy),
         TIMEOUTS["qrcode"],
