@@ -62,15 +62,20 @@ try:
     from ..core.score_cache import save_player as cache_save_player
     from ..core.score_cache import save_scores as cache_save_scores
     from ..core.uploader import (
+        FRIEND_CODE_RE,
+        MSG_FRIEND_CODE_BAD_INPUT,
+        MSG_FRIEND_CODE_NOT_FOUND,
         MsuError,
         MsuInputError,
         MsuTimeoutError,
         aime_error_id,
         bind_arcade,
+        bind_by_friend_code,
         fetch_scores,
         upload_scores,
     )
     from ..core.clients.divingfish.models.oauth import DivingFishScope
+    from ..core import version_watch
 except Exception as e:  # noqa: BLE001
     _core_ok = False
     _core_error = e
@@ -79,7 +84,12 @@ except Exception as e:  # noqa: BLE001
     get = set = now_str = None  # type: ignore[assignment]
     store_all = None  # type: ignore[assignment]  # core 缺失时任务提前返回，不会调用
     bind_arcade = fetch_scores = upload_scores = None  # type: ignore[assignment]
+    bind_by_friend_code = None  # type: ignore[assignment]
+    FRIEND_CODE_RE = None  # type: ignore[assignment]
+    MSG_FRIEND_CODE_BAD_INPUT = "好友码格式不正确：应为 8 位数字。"
+    MSG_FRIEND_CODE_NOT_FOUND = "好友码不存在：机台服务器查不到这个好友码。"
     cache_save_scores = cache_save_player = None  # type: ignore[assignment]
+    version_watch = None  # type: ignore[assignment]
 
     def aime_error_id(exc):  # noqa: ANN001, ANN202
         return None
@@ -136,8 +146,10 @@ if not _core_ok:
 # 帮助文本
 # ============================================================
 SV_HELP = """maimaiDX 舞萌成绩上传帮助
-1.mai绑定 <二维码图片或SGWCMAID文本>
-   绑定机台账号，只需首次；凭据长期有效
+1.mai绑定好友码 12345678
+   绑定机台账号（推荐）。好友码在舞萌个人资料页，8 位数字，不用扫码
+1b.mai绑定 <二维码图片或SGWCMAID文本>
+   扫码绑定（华立服务器 2026-10-20 起故障，暂时用不了）
 2. 上传平台绑定:
    水鱼：发送 dfbind绑定水鱼
    落雪：发送 lxbind绑定落雪
@@ -150,6 +162,9 @@ SV_HELP = """maimaiDX 舞萌成绩上传帮助
 # 命令注册（前缀 trie 最长匹配，mai绑定状态 优先于 mai绑定）
 # ============================================================
 bind = sv.on_prefix("mai绑定", "舞萌上传绑定")
+# 必须注册在 bind 之前/之后都无妨（前缀 trie 最长匹配，好友码更长会优先），
+# 但为了别的插件与可读性，单独列一行。
+bind_friend_code = sv.on_prefix("mai绑定好友码", "mai绑定好友", "舞萌上传绑定好友码")
 bind_raw = sv.on_rex(r"^\s*SGWCMAID", normalize=False)
 status = sv.on_prefix("mai绑定状态")
 upload = sv.on_prefix("mai上传")
@@ -530,6 +545,19 @@ async def _handle_bind(bot: NoneBot, ev: CQEvent, bare: bool = False) -> None:
 
         plain = ev.message.extract_plain_text().strip()
 
+        # 方式零：直接给了好友码（8 位数字）——走不依赖华立 AimeDB 的新绑定路径。
+        # 前缀可能是 mai绑定 / 舞萌上传绑定，先剥掉再看参数。
+        # locked=True：本函数已持有 qq 的并发锁，别再 acquire（否则立刻失败）、
+        # 也别让它 release（外层的 finally 才负责释放，否则会误放掉别人的锁）。
+        _arg = plain
+        for _kw in ("mai绑定", "舞萌上传绑定"):
+            if _arg.startswith(_kw):
+                _arg = _arg[len(_kw):].strip()
+                break
+        if _arg and FRIEND_CODE_RE is not None and FRIEND_CODE_RE.match(_arg):
+            await _handle_bind_friend_code(bot, ev, locked=True)
+            return
+
         # 方式一：文本里宽松提取 SGWCMAID 内容
         content = None
         if plain:
@@ -610,9 +638,86 @@ async def _handle_bind(bot: NoneBot, ev: CQEvent, bare: bool = False) -> None:
         _release(qq)
 
 
+async def _handle_bind_friend_code(bot: NoneBot, ev: CQEvent,
+                                   locked: bool = False) -> None:
+    """用好友码绑定机台账号。
+
+    为什么有这个命令：2026-10-20 起华立给二维码兑换链路加了 Chime 强校验，
+    `ai.sys-allnet.cn/wc_aime/api/get_data` 恒回 errorID 54，扫码绑定整条死掉。
+    而机台游戏服务（拉成绩那条）一直正常，它只认加密后的 userId；好友码就是
+    userId，所以改成用户报好友码即可，完全不碰 wc_aime。
+
+    locked=True 表示调用方已持有该 qq 的并发锁，本次不 acquire 也不 release。
+    """
+    qq = ev.user_id
+
+    if not locked and not _acquire(qq):
+        await bot.send(ev, "⏳ 上一个操作还在进行中，请稍候再试。", at_sender=True)
+        return
+    try:
+        if not _core_ok or bind_by_friend_code is None:
+            await bot.send(
+                ev,
+                _setup_hint("core.uploader 模块") + _recall_hint(),
+                at_sender=True,
+            )
+            return
+
+        plain = ev.message.extract_plain_text()
+        # 去掉命令前缀，只留后面的参数（长前缀优先，避免 "mai绑定好友码" 被 "mai绑定" 截断）
+        for kw in ("mai绑定好友码", "mai绑定好友", "舞萌上传绑定好友码",
+                   "mai绑定", "舞萌上传绑定"):
+            if plain.startswith(kw):
+                plain = plain[len(kw):]
+                break
+        code = plain.strip()
+
+        if not code:
+            await bot.send(
+                ev,
+                "用法：mai绑定好友码 12345678\n"
+                "好友码在舞萌个人资料页（8 位数字），不用扫码。" + _recall_hint(),
+                at_sender=True,
+            )
+            return
+        if not FRIEND_CODE_RE.match(code):
+            await bot.send(
+                ev, f"❌ {MSG_FRIEND_CODE_BAD_INPUT}" + _recall_hint(), at_sender=True
+            )
+            return
+
+        try:
+            creds, nickname = await bind_by_friend_code(code, _proxy())
+        except Exception as e:  # noqa: BLE001
+            log.error(
+                f"[mai_upload] 好友码绑定失败 qq={qq} "
+                f"type={type(e).__name__} code={code} msg={e}"
+            )
+            await bot.send(ev, f"❌ 绑定失败：{_friendly_error(e)}", at_sender=True)
+            return
+
+        set(qq, arcade_creds=creds, bound_at=now_str(), nickname=nickname)
+        await bot.send(
+            ev,
+            f"✅ 已绑定机台账号（{nickname}）\n"
+            "凭据已保存，后续上传无需再扫码\n"
+            "使用 ‘自动上传成绩’ 即可开启自动同步最新成绩",
+            at_sender=True,
+        )
+    finally:
+        if not locked:
+            _release(qq)
+
+
 @bind
 async def bind_cmd(bot: NoneBot, ev: CQEvent):
     await _handle_bind(bot, ev)
+
+
+@bind_friend_code
+async def bind_friend_code_cmd(bot: NoneBot, ev: CQEvent):
+    """mai绑定好友码 11619035 → 用好友码绑定机台账号（不走已失效的二维码兑换）。"""
+    await _handle_bind_friend_code(bot, ev)
 
 
 @bind_raw
@@ -1153,6 +1258,30 @@ async def _tunnel_check_and_alert() -> None:
         )
 
 
+# ------------------------------------------------------------------
+# 国服版本哨兵 + AimeDB 恢复哨兵
+# 接在心跳里，每轮（5 分钟）看一眼：
+#   1) isMaiDown 的 probe.net.desc 里的 OPTION_CNxxx —— 国服真版本号；
+#      升版本说明 Mai-Encoding 可能要变，成绩拉取随时会全挂（实测 1.55 以外全拒）。
+#      注意 latest_version（"26.10"）是站点自己的前端版本，不能用。
+#   2) wc_aime 的 errorID —— 仍 54 说明二维码换凭据还没修，变成别的值就是恢复信号。
+# 一切异常都吞掉，绝不允许影响自动更新。
+# ------------------------------------------------------------------
+async def _version_watch_check() -> None:
+    if version_watch is None:
+        return
+    try:
+        messages, _st = await version_watch.check_once(proxy=_proxy())
+    except Exception as e:  # noqa: BLE001
+        log.info(f"[mai_upload] 版本哨兵异常（不影响自动更新）：{type(e).__name__}: {e}")
+        return
+    for text in messages or []:
+        try:
+            await _notify_superusers(text)
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"[mai_upload] 版本哨兵消息发送失败：{e}")
+
+
 def _auto_targets() -> list:
     """所有「已开启自动上传且有凭据」的用户 [(qq, rec), ...]（快照，避免边遍历边改）。"""
     return [
@@ -1190,6 +1319,9 @@ async def auto_update_tick():
         await _tunnel_check_and_alert()
     except Exception as e:  # noqa: BLE001
         log.warning(f"[mai_upload] 隧道探活异常（不影响自动更新）：{e}")
+
+    # 再跑版本/AimeDB 哨兵：华立升级或修好，都要第一时间知道
+    await _version_watch_check()
 
     now = time.time()
     due = [(qq, rec) for qq, rec in records if _auto_due(rec, now)]
