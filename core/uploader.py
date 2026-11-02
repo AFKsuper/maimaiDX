@@ -156,16 +156,22 @@ _NET_ERRS += (ConnectionError, OSError)
 # ---------- 异常 → 用户可读中文提示（对上层唯一的翻译入口） ----------
 
 MSG_AIME = "二维码兑换失败：机台服务器返回未知错误，请稍后重试"
-# errorID 54（UnknownError）：华立 AimeDB 的 /wc_aime/api/get_data 对任何请求恒回 54
-# （2026-10-24 起实测：换 chipID / 签名顺序 / 字段 / 域名 / UA 均无效），
-# 与用户二维码新旧无关。旧文案「二维码无效或已过期」会让人反复重扫码，属于误导。
+# errorID 54（UnknownError）曾长期占据：2026-10-20 华立给 AimeDB 加 Chime 强校验后，
+# /wc_aime/api/get_data 对任何请求恒回 54。已于 2026-11-01 由 maimai-ffi 0.7.2 修复
+# （https + titlekey 字段 + 紧凑 JSON），现在 54 只会在极旧版本 ffi 上出现。
 MSG_AIME_54 = (
     "二维码兑换失败：机台服务器暂时无法验证二维码"
     "（华立 AimeDB 接口异常，errorID 54）。\n"
-    "这不是你的二维码过期，重新扫码也没用，只能等华立修复。\n"
+    "这通常意味着 maimai-py / maimai-ffi 版本过旧，请联系管理员升级到 1.6.1+。\n"
     "已绑定过的账号不受影响，自动上传照常运行。"
 )
-_AIME_ERROR_HINTS: Dict[int, str] = {54: MSG_AIME_54}
+# errorID 1（ReaderSetupFail）：读卡器侧拒绝，通常是二维码本身无效/已过期/非本机种。
+# 这才是真正该让用户「重新扫码」的情形，旧版把 54 也翻成这句属于误导。
+MSG_AIME_1 = (
+    "二维码无效或已过期，请重新扫码。\n"
+    "注意：二维码有效时间很短，扫完请立刻发给机器人，不要隔几分钟再发。"
+)
+_AIME_ERROR_HINTS: Dict[int, str] = {1: MSG_AIME_1, 54: MSG_AIME_54}
 _AIME_ID_RE = re.compile(r"errorID\s*[:：]?\s*(\d+)", re.IGNORECASE)
 
 

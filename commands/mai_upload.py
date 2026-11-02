@@ -146,10 +146,10 @@ if not _core_ok:
 # 帮助文本
 # ============================================================
 SV_HELP = """maimaiDX 舞萌成绩上传帮助
-1.mai绑定好友码 12345678
-   绑定机台账号（推荐）。好友码在舞萌个人资料页，8 位数字，不用扫码
-1b.mai绑定 <二维码图片或SGWCMAID文本>
-   扫码绑定（华立服务器 2026-10-20 起故障，暂时用不了）
+1.mai绑定 <二维码图片或SGWCMAID文本>
+   扫码绑定（推荐）。华立 11-01 已修复，请把 maimai-py 升级到 1.6.1+ 再扫码
+1b.mai绑定好友码 12345678
+   备用方式，不用扫码。8 位数字是机台账号ID（不是落雪的 15 位好友码）
 2. 上传平台绑定:
    水鱼：发送 dfbind绑定水鱼
    落雪：发送 lxbind绑定落雪
@@ -640,12 +640,14 @@ async def _handle_bind(bot: NoneBot, ev: CQEvent, bare: bool = False) -> None:
 
 async def _handle_bind_friend_code(bot: NoneBot, ev: CQEvent,
                                    locked: bool = False) -> None:
-    """用好友码绑定机台账号。
+    """用机台账号ID绑定（8 位数字）。
 
-    为什么有这个命令：2026-10-20 起华立给二维码兑换链路加了 Chime 强校验，
-    `ai.sys-allnet.cn/wc_aime/api/get_data` 恒回 errorID 54，扫码绑定整条死掉。
-    而机台游戏服务（拉成绩那条）一直正常，它只认加密后的 userId；好友码就是
-    userId，所以改成用户报好友码即可，完全不碰 wc_aime。
+    为什么有这个命令：2026-10-20 华立给二维码兑换链路加 Chime 强校验后，
+    `ai.sys-allnet.cn/wc_aime/api/get_data` 恒回 errorID 54，扫码绑定死掉。
+    2026-11-01 上游 maimai-ffi 0.7.2 已修复，扫码恢复为主路径；这里保留作为
+    备用：不发二维码、只报 8 位机台账号ID 也能绑定，完全不碰 wc_aime。
+
+    注意：这里的 8 位数字是机台 userId，不是落雪的 15 位 friend_code。
 
     locked=True 表示调用方已持有该 qq 的并发锁，本次不 acquire 也不 release。
     """

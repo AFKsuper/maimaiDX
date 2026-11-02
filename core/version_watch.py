@@ -20,8 +20,9 @@ maimaiDX/core/version_watch.py —— 国服版本哨兵 + AimeDB 恢复哨兵
 2) 恢复哨兵
    二维码换凭据（ai.sys-allnet.cn/wc_aime/api/get_data）自 2026-10-20 起对
    任何请求恒回 errorID 54。用户抱怨「二维码过期」其实是这个。
-   用一个格式合法的假码去探：现在恒 54，等华立修好后错误码会变成别的值
-   （例如 QRCodeExpired 等），所以「errorID != 54」就是恢复信号。
+   2026-11-01 上游 maimai-ffi 0.7.2 修复（https + titlekey + 紧凑 JSON），
+   现在探到 errorID=1（ReaderSetupFail）表示报文已能穿过格式层。
+   哨兵保留的意义：以后再出现同类加固，errorID 会重新变回 54，能第一时间发现。
 
 数据许可：版本信息来自 isMaiDown，按其许可要求对外必须标注来源
 「数据来源于 isMaiDown by Chongxi」。本模块所有对外文案已内置该署名。
@@ -51,7 +52,7 @@ logger = logging.getLogger("maimaiDX.version_watch")
 STATUS_URL = "https://mai.chongxi.us/api/status"
 STATUS_TIMEOUT = 15.0
 
-AIME_URL = "http://ai.sys-allnet.cn/wc_aime/api/get_data"
+AIME_URL = "https://ai.sys-allnet.cn/wc_aime/api/get_data"
 AIME_UA = "WC_AIME_LIB"
 AIME_TIMEOUT = 12.0
 # 这两个常量与 maimai_ffi 里的一致（1.41 时代的 chipID 生成式 + COMMON_KEY）。
@@ -59,8 +60,12 @@ AIME_TIMEOUT = 12.0
 # 从而暴露真实 errorID。签名对不对不影响这个用途。
 AIME_CHIP_ID = "A63E-01E68606624"
 AIME_COMMON_KEY = "XcW5FW4cPArBXEk4vzKz3CIrMuA5EVVW"
+# ffi 0.7.2 起必须带 titlekey，且 JSON 必须紧凑（无空格），否则服务端回 54。
+# 详细对照实验见 README 的「AimeDB 报文格式」一节。
+AIME_TITLEKEY = "SDGB"
 
-# 目前已知的「被前置校验统一拒绝」错误码
+# 历史上「被前置校验统一拒绝」的错误码。ffi 0.7.2 修复后这个值不再是 54，
+# 所以探到 != 54 就说明报文能穿过格式层了。
 AIME_BLOCKED_ERROR_ID = 54
 
 ATTRIBUTION = "数据来源于 isMaiDown by Chongxi"
@@ -224,9 +229,10 @@ def format_version_alert(kind: str, new: Dict[str, Any], old: Optional[Dict[str,
 def format_aime_recovered(error_id: Optional[int]) -> str:
     """AimeDB 恢复通知。"""
     return (
-        "✅ 二维码换凭据接口疑似恢复\n"
+        "✅ 二维码换凭据接口已恢复\n"
         f"哨兵探测返回 errorID={error_id}（不再是 {AIME_BLOCKED_ERROR_ID}）。\n"
-        "请让用户发一张新二维码实测；如果确实能绑上，就可以把引导文案改回扫码优先。"
+        "报文已经能穿过机台的格式校验层，说明扫码绑定链路可用。\n"
+        "请让用户发一张新二维码实测；确认能绑上后，可以把引导文案改回扫码优先。"
     )
 
 
@@ -270,7 +276,12 @@ def _build_probe_qr() -> Tuple[str, str]:
 
 
 async def probe_aime(proxy: Optional[str] = None) -> Optional[int]:
-    """探 wc_aime，返回 errorID；请求失败返回 None。"""
+    """探 wc_aime，返回 errorID；请求失败返回 None。
+
+    必须与 maimai_ffi 0.7.2 的报文完全一致（https + titlekey + 紧凑 JSON），
+    否则服务端只回 54，探不到真实状态。2026-11-02 实测：同一份字段，
+    紧凑格式回 errorID=1，带空格格式回 errorID=54。
+    """
     qr_body, ts = _build_probe_qr()
     key = hashlib.sha256(
         (AIME_CHIP_ID + ts + AIME_COMMON_KEY).encode()
@@ -281,18 +292,21 @@ async def probe_aime(proxy: Optional[str] = None) -> Optional[int]:
         "key": key,
         "qrCode": qr_body,
         "timestamp": ts,
+        "titlekey": AIME_TITLEKEY,
     }
+    # 必须紧凑序列化：服务端对 JSON 里的空格敏感（实测带空格恒回 54）
+    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     try:
         kwargs: Dict[str, Any] = {
             "timeout": AIME_TIMEOUT,
-            "headers": {"User-Agent": AIME_UA},
+            "headers": {"User-Agent": AIME_UA, "Content-Type": "application/json"},
         }
         if proxy:
             kwargs["proxy"] = proxy
         else:
             kwargs["trust_env"] = False
         async with httpx.AsyncClient(**kwargs) as client:
-            resp = await client.post(AIME_URL, json=payload)
+            resp = await client.post(AIME_URL, content=body)
         if resp.status_code != 200:
             logger.info(f"[version_watch] AimeDB 探测返回 HTTP {resp.status_code}")
             return None
