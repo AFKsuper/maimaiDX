@@ -300,6 +300,10 @@ async def probe_aime(proxy: Optional[str] = None) -> Optional[int]:
         kwargs: Dict[str, Any] = {
             "timeout": AIME_TIMEOUT,
             "headers": {"User-Agent": AIME_UA, "Content-Type": "application/json"},
+            # 机台这台机器的证书链不完整（Windows Server 2012R2 缺根证书），
+            # 不加这个会直接 ConnectError: CERTIFICATE_VERIFY_FAILED，
+            # 探活永远返回 None，等于哨兵失效。ffi 0.7.2 内部也是不校验的。
+            "verify": False,
         }
         if proxy:
             kwargs["proxy"] = proxy
