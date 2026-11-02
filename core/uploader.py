@@ -43,7 +43,6 @@ import asyncio
 import hashlib
 import logging
 import re
-import struct
 from typing import Any, Awaitable, Dict, List, Optional, Tuple, Type, TypeVar, Union
 
 from ..config import dfconfig
@@ -101,13 +100,6 @@ try:
     from maimai_py.exceptions import PlayerNotAuthorizedError  # type: ignore
 except ImportError:  # pragma: no cover —— 老版本 maimai-py 可能没有该类
     PlayerNotAuthorizedError = None  # type: ignore[assignment]
-
-# 好友码绑定要用 ffi 底层的 rival 免会话接口（maimai_py 没有暴露它）。
-# 缺依赖不影响别的功能：probe_friend_code 入口会抛中文提示。
-try:
-    import maimai_ffi.request as _ffi_request  # type: ignore
-except ImportError:  # pragma: no cover
-    _ffi_request = None  # type: ignore[assignment]
 
 
 def _require_maimai() -> None:
@@ -320,104 +312,6 @@ async def bind_arcade(qr_content: str, http_proxy: Optional[str] = None) -> str:
     return str(creds)
 
 
-# ---------- 对外接口 1-B：好友码绑定（绕开已失效的二维码兑换） ----------
-#
-# 背景：2026-10-20 起华立给二维码兑换链路加了 Chime 强校验，
-# `http://ai.sys-allnet.cn/wc_aime/api/get_data` 对任何请求恒回 errorID 54，
-# 这条路整条死掉（详见 MSG_AIME_54 注释）。但机台游戏服务
-# `maimai-gm.wahlap.com:42081/Maimai2Servlet` 一直正常 —— 它只认一样东西：
-# 用固定 Fernet 密钥加密的 userId。
-#
-# 而「好友码」就是机台 userId（实测：好友码 11619035 拉到的 1325 条成绩，
-# 与该号在水鱼的数据 rating 完全一致；好友码不需要先加好友，也不需要扫码）。
-# 所以改让用户报好友码，本地生成凭据，完全不碰 wc_aime。
-#
-# 说明：`_CREDS_FERNET_KEY` 与 maimai_ffi 内部用的常量相同，用它加密
-# struct.pack(">Q", userId) 得到的字符串，和原先扫码换出来的 creds 等价，
-# 可直接喂给 fetch_scores / upload_scores。
-
-_CREDS_FERNET_KEY = b"C4H2HV3vIbMFzLJvosbie9qDEqH32zkqPZYr8cJUiDg="
-
-# 好友码：机台个人资料里的纯数字编号，实测 8 位；放宽到 8–10 位以兼容扩容。
-# 用 [0-9] 而不是 \d：Python 的 \d 会匹配全角数字（１、２），int() 却解不了。
-FRIEND_CODE_RE = re.compile(r"^[0-9]{8,10}$")
-
-MSG_FRIEND_CODE_NOT_FOUND = (
-    "好友码不存在：机台服务器查不到这个好友码。\n"
-    "请打开舞萌个人资料页核对「好友码」（8 位数字），重新发送。"
-)
-
-MSG_FRIEND_CODE_BAD_INPUT = (
-    "好友码格式不正确：应为 8 位数字（机台个人资料页里的「好友码」）。"
-)
-
-
-def friend_code_to_creds(user_id: int) -> str:
-    """把机台 userId（= 好友码）编码成可持久化的机台凭据字符串。
-
-    等价于原二维码兑换的产物，只是不需要联网。
-    """
-    try:
-        from cryptography.fernet import Fernet  # noqa: PLC0415 —— 缺依赖时给中文提示
-    except ImportError as e:  # pragma: no cover
-        raise MsuError(
-            "缺少依赖 cryptography，请先安装：pip install cryptography"
-        ) from e
-    token = Fernet(_CREDS_FERNET_KEY).encrypt(struct.pack(">Q", int(user_id)))
-    return token.decode("ascii")
-
-
-async def probe_friend_code(user_id: int,
-                            http_proxy: Optional[str] = None) -> Optional[str]:
-    """用 rival 免会话接口确认好友码存在，返回机台昵称；查不到返回 None。
-
-    该接口不需要二维码、不需要登录会话，只按 userId 查。服务器 IP 被华立
-    屏蔽，所以必须带 http_proxy（手机跳板），否则抛 TitleServerBlockedError。
-    """
-    _require_maimai()
-    if _ffi_request is None:  # pragma: no cover
-        raise MsuError("缺少依赖 maimai-ffi，请先安装：pip install maimai-ffi")
-    uid = int(user_id)
-    payload = {"rivalId": uid, "userId": uid}
-
-    async def _call() -> Any:
-        gen = _ffi_request.AsyncClientGenerator(http_proxy=http_proxy)
-        async with gen as pool:
-            return await _ffi_request.request(
-                "GetUserRivalDataApi", payload, pool, uid
-            )
-
-    data = await with_timeout(_call(), TIMEOUTS["qrcode"])
-    rival = (data or {}).get("userRivalData") or {}
-    name = rival.get("rivalName")
-    if not name or not str(name).strip():
-        return None
-    return str(name).strip()
-
-
-async def bind_by_friend_code(friend_code: str,
-                              http_proxy: Optional[str] = None) -> Tuple[str, str]:
-    """用好友码完成绑定，返回 (credentials, 机台昵称)。
-
-    - friend_code：8 位数字字符串（可含首尾空白）。
-    - http_proxy：机台域名对服务器 IP 屏蔽，必须传手机跳板代理。
-    - 好友码不存在抛 MsuInputError(MSG_FRIEND_CODE_NOT_FOUND)；
-      格式错抛 MsuInputError(MSG_FRIEND_CODE_BAD_INPUT)。
-    """
-    _require_maimai()
-    code = str(friend_code or "").strip()
-    if not FRIEND_CODE_RE.match(code):
-        raise MsuInputError(MSG_FRIEND_CODE_BAD_INPUT)
-    uid = int(code)
-    nickname = await probe_friend_code(uid, http_proxy=http_proxy)
-    if nickname is None:
-        raise MsuInputError(MSG_FRIEND_CODE_NOT_FOUND)
-    creds = friend_code_to_creds(uid)
-    logger.info("好友码绑定成功 user_id=%s nickname=%s creds=%s",
-                uid, nickname, mask(creds))
-    return creds, nickname
-
-
 # ---------- 对外接口 2：拉成绩 ----------
 
 async def fetch_scores(creds: str,
@@ -584,9 +478,6 @@ def report_ok(report: Dict[str, Any]) -> bool:
 __all__ = [
     "bind_arcade", "fetch_scores", "upload_scores", "report_ok",
     "with_timeout", "friendly_message", "set_default_timeouts", "TIMEOUTS",
-    # 好友码绑定（绕过已失效的二维码兑换）
-    "bind_by_friend_code", "probe_friend_code", "friend_code_to_creds",
-    "FRIEND_CODE_RE", "MSG_FRIEND_CODE_NOT_FOUND", "MSG_FRIEND_CODE_BAD_INPUT",
     "MSG_AIME_54", "aime_error_id",
     "MsuError", "MsuInputError", "MsuTimeoutError",
     # 便于上层做 except 特判（按需引用，不必全部 try）

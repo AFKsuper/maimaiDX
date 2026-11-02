@@ -62,15 +62,11 @@ try:
     from ..core.score_cache import save_player as cache_save_player
     from ..core.score_cache import save_scores as cache_save_scores
     from ..core.uploader import (
-        FRIEND_CODE_RE,
-        MSG_FRIEND_CODE_BAD_INPUT,
-        MSG_FRIEND_CODE_NOT_FOUND,
         MsuError,
         MsuInputError,
         MsuTimeoutError,
         aime_error_id,
         bind_arcade,
-        bind_by_friend_code,
         fetch_scores,
         upload_scores,
     )
@@ -84,10 +80,6 @@ except Exception as e:  # noqa: BLE001
     get = set = now_str = None  # type: ignore[assignment]
     store_all = None  # type: ignore[assignment]  # core 缺失时任务提前返回，不会调用
     bind_arcade = fetch_scores = upload_scores = None  # type: ignore[assignment]
-    bind_by_friend_code = None  # type: ignore[assignment]
-    FRIEND_CODE_RE = None  # type: ignore[assignment]
-    MSG_FRIEND_CODE_BAD_INPUT = "好友码格式不正确：应为 8 位数字。"
-    MSG_FRIEND_CODE_NOT_FOUND = "好友码不存在：机台服务器查不到这个好友码。"
     cache_save_scores = cache_save_player = None  # type: ignore[assignment]
     version_watch = None  # type: ignore[assignment]
 
@@ -147,9 +139,7 @@ if not _core_ok:
 # ============================================================
 SV_HELP = """maimaiDX 舞萌成绩上传帮助
 1.mai绑定 <二维码图片或SGWCMAID文本>
-   扫码绑定（推荐）。华立 11-01 已修复，请把 maimai-py 升级到 1.6.1+ 再扫码
-1b.mai绑定好友码 12345678
-   备用方式，不用扫码。8 位数字是机台账号ID（不是落雪的 15 位好友码）
+   扫码绑定。请确保 maimai-py 已升级到 1.6.1+，扫完立刻发，别隔几分钟
 2. 上传平台绑定:
    水鱼：发送 dfbind绑定水鱼
    落雪：发送 lxbind绑定落雪
@@ -162,9 +152,6 @@ SV_HELP = """maimaiDX 舞萌成绩上传帮助
 # 命令注册（前缀 trie 最长匹配，mai绑定状态 优先于 mai绑定）
 # ============================================================
 bind = sv.on_prefix("mai绑定", "舞萌上传绑定")
-# 必须注册在 bind 之前/之后都无妨（前缀 trie 最长匹配，好友码更长会优先），
-# 但为了别的插件与可读性，单独列一行。
-bind_friend_code = sv.on_prefix("mai绑定好友码", "mai绑定好友", "舞萌上传绑定好友码")
 bind_raw = sv.on_rex(r"^\s*SGWCMAID", normalize=False)
 status = sv.on_prefix("mai绑定状态")
 upload = sv.on_prefix("mai上传")
@@ -545,19 +532,6 @@ async def _handle_bind(bot: NoneBot, ev: CQEvent, bare: bool = False) -> None:
 
         plain = ev.message.extract_plain_text().strip()
 
-        # 方式零：直接给了好友码（8 位数字）——走不依赖华立 AimeDB 的新绑定路径。
-        # 前缀可能是 mai绑定 / 舞萌上传绑定，先剥掉再看参数。
-        # locked=True：本函数已持有 qq 的并发锁，别再 acquire（否则立刻失败）、
-        # 也别让它 release（外层的 finally 才负责释放，否则会误放掉别人的锁）。
-        _arg = plain
-        for _kw in ("mai绑定", "舞萌上传绑定"):
-            if _arg.startswith(_kw):
-                _arg = _arg[len(_kw):].strip()
-                break
-        if _arg and FRIEND_CODE_RE is not None and FRIEND_CODE_RE.match(_arg):
-            await _handle_bind_friend_code(bot, ev, locked=True)
-            return
-
         # 方式一：文本里宽松提取 SGWCMAID 内容
         content = None
         if plain:
@@ -638,88 +612,9 @@ async def _handle_bind(bot: NoneBot, ev: CQEvent, bare: bool = False) -> None:
         _release(qq)
 
 
-async def _handle_bind_friend_code(bot: NoneBot, ev: CQEvent,
-                                   locked: bool = False) -> None:
-    """用机台账号ID绑定（8 位数字）。
-
-    为什么有这个命令：2026-10-20 华立给二维码兑换链路加 Chime 强校验后，
-    `ai.sys-allnet.cn/wc_aime/api/get_data` 恒回 errorID 54，扫码绑定死掉。
-    2026-11-01 上游 maimai-ffi 0.7.2 已修复，扫码恢复为主路径；这里保留作为
-    备用：不发二维码、只报 8 位机台账号ID 也能绑定，完全不碰 wc_aime。
-
-    注意：这里的 8 位数字是机台 userId，不是落雪的 15 位 friend_code。
-
-    locked=True 表示调用方已持有该 qq 的并发锁，本次不 acquire 也不 release。
-    """
-    qq = ev.user_id
-
-    if not locked and not _acquire(qq):
-        await bot.send(ev, "⏳ 上一个操作还在进行中，请稍候再试。", at_sender=True)
-        return
-    try:
-        if not _core_ok or bind_by_friend_code is None:
-            await bot.send(
-                ev,
-                _setup_hint("core.uploader 模块") + _recall_hint(),
-                at_sender=True,
-            )
-            return
-
-        plain = ev.message.extract_plain_text()
-        # 去掉命令前缀，只留后面的参数（长前缀优先，避免 "mai绑定好友码" 被 "mai绑定" 截断）
-        for kw in ("mai绑定好友码", "mai绑定好友", "舞萌上传绑定好友码",
-                   "mai绑定", "舞萌上传绑定"):
-            if plain.startswith(kw):
-                plain = plain[len(kw):]
-                break
-        code = plain.strip()
-
-        if not code:
-            await bot.send(
-                ev,
-                "用法：mai绑定好友码 12345678\n"
-                "好友码在舞萌个人资料页（8 位数字），不用扫码。" + _recall_hint(),
-                at_sender=True,
-            )
-            return
-        if not FRIEND_CODE_RE.match(code):
-            await bot.send(
-                ev, f"❌ {MSG_FRIEND_CODE_BAD_INPUT}" + _recall_hint(), at_sender=True
-            )
-            return
-
-        try:
-            creds, nickname = await bind_by_friend_code(code, _proxy())
-        except Exception as e:  # noqa: BLE001
-            log.error(
-                f"[mai_upload] 好友码绑定失败 qq={qq} "
-                f"type={type(e).__name__} code={code} msg={e}"
-            )
-            await bot.send(ev, f"❌ 绑定失败：{_friendly_error(e)}", at_sender=True)
-            return
-
-        set(qq, arcade_creds=creds, bound_at=now_str(), nickname=nickname)
-        await bot.send(
-            ev,
-            f"✅ 已绑定机台账号（{nickname}）\n"
-            "凭据已保存，后续上传无需再扫码\n"
-            "使用 ‘自动上传成绩’ 即可开启自动同步最新成绩",
-            at_sender=True,
-        )
-    finally:
-        if not locked:
-            _release(qq)
-
-
 @bind
 async def bind_cmd(bot: NoneBot, ev: CQEvent):
     await _handle_bind(bot, ev)
-
-
-@bind_friend_code
-async def bind_friend_code_cmd(bot: NoneBot, ev: CQEvent):
-    """mai绑定好友码 11619035 → 用好友码绑定机台账号（不走已失效的二维码兑换）。"""
-    await _handle_bind_friend_code(bot, ev)
 
 
 @bind_raw
